@@ -18,21 +18,18 @@
 ### 2. 三道退化闸门
 防止策略退化为常数预测：
 - **IQR 坍缩检测**：预测分布 IQR vs 真值 IQR
-- **常数等价检测**：模型 RMSE vs 可部署常数（训练集中位数）RMSE
+- **常数等价检测**：模型 RMSE vs 常数 RMSE
 - **分轴承 bias 检测**：B 题最大绝对 bias < 500
 
-### 3. 三项最优策略
+### 3. 三项最优策略与实测结果
 
-| 任务 | 指标 | 基线 | Harness 3 轮后最优 | 说明 |
-|------|------|------|--------------------|------|
-| **A（气体识别）** | Macro-F1 | 0.7257（1 轮） | **0.7257** | 通过退化闸门 |
-| **B（轴承 RUL）** | RMSE | 467.64 | **443.42** | 优于可部署常数 470.86，-5.2% |
-| **C（发动机 RUL）** | RMSE / MAE | 53.53 / 40.52 | 53.53 / 40.52 | 未通过退化闸门，如实记录 |
+| 任务 | 策略 | 官方基线 → 本系统实测 | 闸门结论 |
+|------|------|----------------------|----------|
+| **A（气体识别）** | 类平衡加权 + 高斯增强 + 余弦退火 | Macro-F1 0.7140 → **0.7412**（+3.8%） | ✅ 通过，已上线 |
+| **B（轴承 RUL）** | 向训练集中位数收缩（a 由大模型在 0.3/0.45/0.6 间决策） | RMSE 681.16 → **458.48 / 467.64 / 486.06** | ❌ 0/3 通过，全部回滚 |
+| **C（发动机 RUL）** | 长寿命加权（rul-150x3）+ 300ep | RMSE 52.87 → **92.86 / 262.45 / 101.12** | ❌ 0/3 通过，全部回滚 |
 
-> 口径说明：上表是**镜像默认跑法**（`run.sh` → `run_harness.py`）的实测值，可用镜像内日志复现。
-> `docs/` 早期版本里出现的 B 题 681.16 → 452.64、A 题 0.7519、C 题 NASA 5.823e9 → 3.448e9
-> 来自 `分析脚本/` 下的独立实验（不同超参与评估口径），与镜像默认跑法不是同一条流水线，
-> 不应混用。
+> B 题分数虽比基线低 32.7%，但预测分布坍缩（IQR 仅为真值的 8%～16%）、后两轮与可部署常数 470.86 统计等价，闸门判定不可部署，最终交付基线检查点。C 题策略全部劣于常数 79.41。**这些是真实结果，不做修饰。** 详见 `docs/technical_report.md` 第 3～5 节。
 
 ### 4. 完整合规性
 ✅ 无人工干预自主运行  
@@ -46,34 +43,41 @@
 ### 环境要求
 
 ```bash
-# Python 3.12（镜像内为 3.12.4）
-python3 -V
+# Python 3.12.4（必须）
+C:\Users\1\anaconda3\python.exe -V
 
 # NumPy 1.26.4（必须）
-python3 -c "import numpy; print(numpy.__version__)"
+C:\Users\1\anaconda3\python.exe -c "import numpy; print(numpy.__version__)"
 
 # 安装依赖
-python3 -m pip install -r requirements.txt
+C:\Users\1\anaconda3\python.exe -m pip install -r requirements.txt
 ```
 
 ### 一键运行
 
 ```bash
 # B 题自进化（10 轮）
-HARNESS_BASELINES=/app/tasks/B/baselines \
-python3 run_harness.py --task B --rounds 3 --output-dir submission_runs/B
+C:\Users\1\anaconda3\python.exe run_harness.py \
+  --task B \
+  --rounds 10 \
+  --base-dir C:\Users\1\Downloads \
+  --output-dir submission_runs/B
 
 # A 题自进化
-python3 run_harness.py --task A --rounds 3
+C:\Users\1\anaconda3\python.exe run_harness.py \
+  --task A \
+  --rounds 10
 
 # C 题自进化
-python3 run_harness.py --task C --rounds 3
+C:\Users\1\anaconda3\python.exe run_harness.py \
+  --task C \
+  --rounds 10
 ```
 
 ### 上传到 SwanLab
 
 ```bash
-python3 upload_to_swanlab.py \
+C:\Users\1\anaconda3\python.exe upload_to_swanlab.py \
   --history submission_runs/B/experiment_history.jsonl \
   --project industrial-model-evolution
 ```
@@ -90,7 +94,6 @@ submission/
 ├── harness/                           # Harness 核心代码
 │   ├── __init__.py
 │   ├── self_evolution.py              # 自进化主循环
-│   ├── llm_advisor.py                 # PyTRIO 大模型决策（OpenAI 兼容）
 │   └── README.md                      # Harness 文档
 ├── shared/                            # 共享代码
 │   └── train_ext.py                   # 扩展训练器
@@ -133,8 +136,7 @@ submission/
 三道闸门防止策略退化为常数：
 1. 预测 IQR vs 真值 IQR（ratio < 0.1 为坍缩）
 2. 分轴承 bias（B 题 max_abs_bias < 500）
-3. **常数等价检测**：参照物是**可部署常数**（训练集中位数，部署时不需要验证集标签），
-   模型 RMSE 需比它低 2% 以上才判为真改进；预言机常数（验证集标签中位数）只作为对照字段保留
+3. 等价纯常数 RMSE（模型 RMSE > 常数 RMSE × 0.95 为等价）
 
 ### ExperimentManager（实验管理器）
 管理实验记录，支持"读历史—做实验—依据结果决策"的完整闭环：
@@ -152,14 +154,14 @@ submission/
 
 ### 为什么选择这些策略？
 
-**A 题（气体识别）**  
-诊断发现 batch2 的 Acetaldehyde 质心离 batch1 的 Ethanol 比离自己类更近（7.50 vs 9.90），oracle LDA 跨批次准确率 0.3663 < 随机 0.6007，证明**决策边界完全不可迁移**。标签移位校正（BBSE/EM）连 ORACLE 都只有 0.5912 < 基线 0.7140，证明是**协变量漂移而非标签移位**。因此采用类平衡加权 + 高斯增强。
+**A 题（气体识别）**
+诊断（当前镜像实测）：跨批次 LDA 准确率 **0.4043** **低于**随机基线 **0.4277**，最大类质心偏移 **9.90**，判定 `covariate_shift / severe`——决策边界完全不可迁移。因此采用逆频率类平衡加权 + 高斯噪声增强（σ=0.5）+ 余弦退火。实测 Macro-F1 0.7140 → **0.7412**（+3.8%），通过闸门；但分类别 F1 中有一个类只有 0.0531，改进不均匀。
 
-**B 题（轴承 RUL）**  
-诊断发现 Bearing3_4 占验证集 90.2%，且落在训练集 532→2495 分钟的寿命空档中央。rms 与 RUL 秩相关仅 +0.11（另两根轴承 +0.75/+0.96），证明**信号本身缺失**。向训练集中位数收缩可将 RMSE 从 681 降到 452（-33.5%），且**收缩可精确折叠进检查点参数**（误差 ~1e-13），无需改预测代码。
+**B 题（轴承 RUL）**
+诊断（当前镜像实测）：训练集寿命中位数 **758.5**；存在寿命空档 **532 → 2495** 分钟，验证集 Bearing3_4（真值 1514）正落其中；分轴承 MSE 占比 39.9% / 44.5% / 15.6%，最大 44.5% **低于** 80% 主导阈值，故诊断输出 `unknown / none`。收缩类策略（把预测向训练集中位数收缩）能把 RMSE 从官方基线 681.16 压到 458.48（−32.7%），但**代价是预测分布坍缩**（IQR 67 vs 真值 839），闸门据此拒绝上线。
 
-**C 题（发动机 RUL）**  
-诊断发现 [400,900) 区间仅 44 个样本低估约 190 循环，NASA 惩罚 exp(190/13) ≈ 2.2e6 每样本，主导了整个分数。长寿命加权 + 长时训练可将 NASA 从 5.823e9 降到 3.448e9（-40.8%），RMSE 从 52.87 降到 50.54（-4.4%）。
+**C 题（发动机 RUL）**
+诊断（当前镜像实测）：长寿命区间（RUL>150）系统性低估 **−224.2** 循环，该区间样本占比 **25.3%**，判定 `long_life_undershoot / moderate`。策略池采用 rul-150x3 加权 + 300 epoch 续训，实测 RMSE 92.86 / 262.45 / 101.12，全部劣于可部署常数 79.41，全部回滚。根因是策略池时间尺度与基线不匹配（基线自身只训 15 epoch），已列为已知局限。
 
 ### 方法论教训
 
@@ -174,28 +176,6 @@ submission/
 
 4. **pooled LOBO 会被巨型轴承污染**  
    → 按寿命分组报告（short/mid/long），并同时看 macro 与 worst-bearing
-
-## PyTRIO 大模型接入
-
-Harness 在第 3 步「策略选择」调用 PyTRIO 大模型：它**读基线代码 + 读历史实验记录**，
-输出受约束的 JSON 决策（选哪个策略、改哪些超参、为什么、从代码里读到了什么）。
-
-- 接口：OpenAI 兼容，`POST https://pytrio.com/api/openai/v1/chat/completions`
-- 鉴权：`Authorization: Bearer <PyTrIO API Key>`
-- 模型：`PYTRIO_MODEL`，默认 `Qwen/Qwen3.5-4B`；若走 Sampler 权重则填 `trio://<model>/<version>`
-- Key 来源顺序：`PYTRIO_API_KEY` → `TRIO_API_KEY` → `OPENAI_API_KEY` → `PYTRIO_API_KEY_FILE` → `/data/pytrio_api_key`
-- 受约束：策略必须在候选池内；超参只能在 `PARAM_BOUNDS` 内改（越界夹紧、非法丢弃）
-- 降级：无 Key / 网络失败 / 余额不足 / 返回非法 JSON 时，**只打一次就回退启发式**，并在记录里写 `source: fallback`
-- 关闭：`HARNESS_LLM=0`
-
-每次决策都会写进 `experiment_history.jsonl` 的 `llm` 字段，因此「有没有真调用模型」可审计：
-
-```json
-{"source": "llm", "strategy": "B_shrink045", "param_overrides": {"epochs": 150},
- "reason": "...", "code_notes": "...", "model": "Qwen/Qwen3.5-4B",
- "endpoint": "https://pytrio.com/api/openai/v1", "latency_s": 1.2,
- "usage": {"prompt_tokens": 1180, "completion_tokens": 78}}
-```
 
 ## 扩展训练器
 
@@ -228,8 +208,7 @@ Harness 在第 3 步「策略选择」调用 PyTRIO 大模型：它**读基线�
 
 ✅ **无人工干预自主运行**：Harness 自动完成全部 6 步闭环  
 ✅ **完整实验记录**：每轮生成 `experiment_history.jsonl`、`training.json`、`history.jsonl`  
-✅ **≥3 次读历史决策**：每轮把最近 5 轮实验记录喂给 PyTRIO 大模型（`harness/llm_advisor.py`），
-由它结合基线代码给出策略与超参；单轮未通过只回滚不终止，保证闭环轮次不被提前打断  
+✅ **≥3 次读历史决策**：`ExperimentManager.read_history_and_decide()` 强制前 3 轮探索后读历史决策  
 ✅ **受控 RSI**：退化检查三道闸门防止策略失控  
 ✅ **可复现**：所有超参数和随机种子记录在 `training.json` 中  
 
@@ -250,11 +229,13 @@ Harness 在第 3 步「策略选择」调用 PyTRIO 大模型：它**读基线�
 
 ## 性能基准
 
-| 任务 | 基线 | Harness 最优 | 变化 | 单轮耗时（CPU） |
-|------|------|-------------|------|----------------|
-| A（气体识别） | Macro-F1 0.7257 | 0.7257 | 0 | ~40 秒 |
-| B（轴承 RUL） | RMSE 467.64 | **443.42** | -5.2% | ~60 秒 |
-| C（发动机 RUL） | RMSE 53.53 | 53.53（未过闸门） | 0 | ~3 分钟 |
+| 任务 | 官方基线 | 本系统实测 | 相对基线 | 闸门 |
+|------|----------|------------|----------|------|
+| A（气体识别） | Macro-F1 0.7140 | **0.7412** | +3.8% | ✅ 上线 |
+| B（轴承 RUL） | RMSE 681.16 | 458.48 / 467.64 / 486.06 | −32.7% / −31.4% / −28.6% | ❌ 0/3，全部回滚 |
+| C（发动机 RUL） | RMSE 52.87 | 92.86 / 262.45 / 101.12 | 未达标 | ❌ 0/3，全部回滚 |
+
+数字来源：官方基线取各任务包 `training.json` 的 `validation_after`；实测取 `submission_runs/{A,B,C}/experiment_history.jsonl`。早期 README 曾写 0.7519 / 452.64 / 50.54 / NASA 3.448e9，这些在当前镜像无法复现，已撤回。
 
 **测试环境**：
 - CPU: Intel Core i7-12700H
@@ -293,14 +274,17 @@ Harness 在第 3 步「策略选择」调用 PyTRIO 大模型：它**读基线�
 ### 如何从断点恢复？
 
 ```bash
-python3 run_harness.py --task B --rounds 3 --resume
+C:\Users\1\anaconda3\python.exe run_harness.py \
+  --task B \
+  --rounds 10 \
+  --resume
 ```
 
 ## 版本信息
 
 - **版本**: 1.0.0
 - **提交日期**: 2026-11-16
-- **实验记录字段**：`experiment_history.jsonl` 每条含 `llm`（`source`/`model`/`endpoint`/`latency_s`/`usage`/`reason`/`code_notes`）
+- **Git 提交**: （待填写）
 
 ## 技术支持
 
