@@ -109,36 +109,35 @@ submission_runs/B/
 {
   "stage_id": "round-01",
   "strategy": {
-    "name": "B_optimal",
+    "name": "B_shrink030",
     "sample_weight": "none",
     "gauss_aug": 0.0,
     "cosine_anneal": false,
-    "shrink_a": 0.45,
+    "shrink_a": 0.3,
     "shrink_center": "median",
     "target_transform": "identity",
     "epochs": 120,
     "learning_rate": 0.01,
     "batch_size": 128
   },
-  "validation_rmse": 452.64,
-  "validation_macro_f1": null,
-  "nasa_score": null,
+  "validation_metric": 458.47844336937425,
+  "passed": false,
   "degradation_checks": {
     "iqr_collapse": {
-      "collapsed": false,
-      "ratio": 0.85,
-      "pred_iqr": 420.5,
-      "true_iqr": 495.2
+      "collapsed": true,
+      "ratio": 0.08007084509844,
+      "pred_iqr": 67.17943903759124,
+      "true_iqr": 839.0
     },
     "constant_equivalence": {
       "equivalent_to_constant": false,
-      "rmse_model": 452.64,
-      "rmse_const": 470.86
+      "rmse_model": 458.47844336937425,
+      "rmse_const": 470.8582356845544
     },
     "bias_per_bearing": {
-      "Bearing1_4": 166.5,
-      "Bearing2_4": 326.3,
-      "Bearing3_4": -427.4
+      "Bearing1_4": 569.5,
+      "Bearing2_4": 581.5,
+      "Bearing3_4": -116.5
     },
     "max_abs_bias": 427.4
   },
@@ -185,11 +184,11 @@ for record in harness.experiment_manager.history:
 
 ### 为什么选择这些策略？
 
-**A 题**：诊断发现 batch2 的 Acetaldehyde 质心离 batch1 的 Ethanol 比离自己类更近（7.50 vs 9.90），oracle LDA 跨批次准确率 0.3663 < 随机 0.6007，证明**决策边界完全不可迁移**。标签移位校正（BBSE/EM）连 ORACLE 都只有 0.5912 < 基线 0.7140，证明是**协变量漂移而非标签移位**。因此采用类平衡加权 + 高斯增强。
+**A 题**：诊断实测跨批次 LDA 准确率 **0.4043 < 随机基线 0.4277**，最大类质心偏移 **9.90**，判定协变量漂移（severe）——决策边界不可迁移。因此采用逆频率类平衡加权 + 高斯噪声增强（σ=0.5）+ 余弦退火。实测 Macro-F1 0.7140 → **0.7412**（+3.8%），通过闸门。
 
-**B 题**：诊断发现 Bearing3_4 占验证集 90.2%，且落在训练集 532→2495 分钟的寿命空档中央。rms 与 RUL 秩相关仅 +0.11（另两根轴承 +0.75/+0.96），证明**信号本身缺失**。向训练集中位数收缩可将 RMSE 从 681 降到 452（-33.5%），且**收缩可精确折叠进检查点参数**（误差 ~1e-13），无需改预测代码。
+**B 题**：诊断实测训练集中位数 **758.5**、寿命空档 **532 → 2495**（验证集 Bearing3_4 落在其中）、分轴承 MSE 占比 39.9% / 44.5% / 15.6%（最大 44.5% 低于 80% 阈值）。收缩类策略把 RMSE 从官方基线 681.16 压到 458.48（−32.7%），但预测 IQR 仅 67（真值 839），闸门判定分布坍缩并回滚。
 
-**C 题**：诊断发现 [400,900) 区间仅 44 个样本低估约 190 循环，NASA 惩罚 exp(190/13) ≈ 2.2e6 每样本，主导了整个分数。长寿命加权 + 长时训练可将 NASA 从 5.823e9 降到 3.448e9（-40.8%），RMSE 从 52.87 降到 50.54（-4.4%）。
+**C 题**：诊断实测长寿命区间低估 **−224.2** 循环（样本占比 25.3%）。策略为 rul-150x3 加权 + 300ep 续训，实测 RMSE 92.86 / 262.45 / 101.12，全部劣于可部署常数 79.41，全部回滚。原因是策略池时间尺度与基线（15 epoch）不匹配，属已知局限。
 
 ### 方法论教训（写进技术报告）
 
