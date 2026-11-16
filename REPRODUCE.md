@@ -62,65 +62,65 @@ C:\Users\1\anaconda3\python.exe run_harness.py \
 ============================================================
 
 [1/6] 漂移监测...
+  最大 MSE 占比: 44.5% (阈值 80.0%) → 无主导轴承
 [2/6] 诊断归因...
-  根因: life_gap + cross_bearing_level_misalignment
-  证据: 主导轴承 Bearing3_4 占 MSE 90.2%，且落在寿命空档 (532, 2495, 1963)
-  动作: shrink_toward_median
+  根因: unknown (none)
 [3/6] 策略选择...
-  策略: B_optimal
+  调用 PyTRIO 大模型（Qwen/Qwen3.5-4B @ https://pytrio.com/api/openai/v1）...
+  ✅ 大模型决策: B_shrink030 {'shrink_a': 0.3} (1.2s)
+     理由: 诊断显示无显著主导轴承且当前策略为B_shrink045，降低shrink_a至0.3可增强模型对非主导样本的拟合能力以改善RMSE
 [4/6] 实验优化...
 [5/6] 退化检查...
+  ⚠️ 预测分布坍缩 (IQR 67.18 / 真值 839, ratio 0.080)
 [6/6] 评估上线...
-  ✅ 上线成功 (RMSE=452.64)
+  ❌ 上线失败，回滚到上一轮检查点
 
-📊 轮次 1/10 结果:
-   RMSE: 452.64
-   通过: ✅
-   策略: B_optimal
+📊 轮次 1/3 结果:
+   RMSE: 458.48
+   通过: ❌
+   策略: B_shrink030
+
+⚠️  轮次 1 未通过退化检查，已回滚，继续下一轮探索
 
 ...
-
 ======================================================================
 自进化完成
 ======================================================================
-总轮数: 10
-通过轮数: 10
-最优 RMSE: 452.64
-最优策略: B_optimal
-最优轮次: round-01
+总轮数: 3
+通过轮数: 0
 
 实验记录: submission_runs/B/experiment_history.jsonl
 输出目录: submission_runs/B
 ```
 
-**预期时间**: ~5 分钟（10 轮 × 30 秒/轮）
+**实测时间**: B 题三轮合计约 1 分钟（纯 CPU，样本 7032 / 1679）。**实测结果**: 458.48 / 467.64 / 486.06，三轮全部回滚（原因见 `degradation_checks`）。
 
 ### 2. A 题（气体识别）
 
 ```bash
 C:\Users\1\anaconda3\python.exe run_harness.py \
   --task A \
-  --rounds 10 \
+  --rounds 1 \
   --base-dir C:\Users\1\Downloads \
   --output-dir submission_runs/A
 ```
 
-**预期最优 Macro-F1**: 0.7519（基线 0.7140，+5.3%）  
-**预期时间**: ~2 分钟（10 轮 × 12 秒/轮）
+**实测结果**: Macro-F1 **0.7412**（官方基线 0.7140，+3.8%），1 轮通过闸门并上线。
+**实测时间**: 单轮 1 分钟左右。
 
 ### 3. C 题（发动机 RUL）
 
 ```bash
 C:\Users\1\anaconda3\python.exe run_harness.py \
   --task C \
-  --rounds 10 \
+  --rounds 3 \
   --base-dir C:\Users\1\Downloads \
   --output-dir submission_runs/C
 ```
 
-**预期最优 RMSE**: 50.54（基线 52.87，-4.4%）  
-**预期最优 NASA**: 3.448e9（基线 5.823e9，-40.8%）  
-**预期时间**: ~15 分钟（10 轮 × 90 秒/轮）
+**实测结果**: RMSE 92.86 / 262.45 / 101.12，全部劣于可部署常数 79.41，三轮全部回滚。
+**实测时间**: 三轮约 3～5 分钟。
+**说明**: C 题策略池当前与基线时间尺度不匹配（基线只训 15 epoch，策略一律 300 epoch），这是已知局限，不做美化。
 
 ## 手动复现（逐步）
 
@@ -228,12 +228,14 @@ history.jsonl        # 逐 epoch 记录
 type submission_runs\B\experiment_history.jsonl
 ```
 
-预期（每行一条 JSON 记录）:
+预期（每行一条 JSON 记录，字段名为真实结构）:
 ```json
-{"stage_id": "round-01", "strategy": {"name": "B_optimal", ...}, "validation_rmse": 452.64, "passed": true, ...}
-{"stage_id": "round-02", "strategy": {"name": "B_optimal_tuned", ...}, "validation_rmse": 452.80, "passed": true, ...}
-...
+{"stage_id": "round-01", "strategy": {"name": "B_shrink030", "shrink_a": 0.3, ...}, "validation_metric": 458.47844336937425, "passed": false, "degradation_checks": {"iqr_collapse": {"collapsed": true, "ratio": 0.08007084509844}, ...}, "llm": {"source": "llm", "latency_s": 1.2}, ...}
+{"stage_id": "round-02", "strategy": {"name": "B_shrink045", ...}, "validation_metric": 467.63664511562735, "passed": false, ...}
+{"stage_id": "round-03", "strategy": {"name": "B_shrink060", ...}, "validation_metric": 486.0615916351393, "passed": false, ...}
 ```
+
+> 注意：暂无可上线轮次时，`passed` 全为 `false`，这是闸门在起作用，不是运行失败。
 
 ### 检查 training.json
 
@@ -282,11 +284,13 @@ C:\Users\1\anaconda3\python.exe run_harness.py \
 
 ## 性能基准
 
-| 任务 | 基线 RMSE / Macro-F1 | 最优 RMSE / Macro-F1 | 提升 | 单轮耗时 |
-|------|---------------------|---------------------|------|---------|
-| A（气体识别） | 0.7140 (Macro-F1) | **0.7519** | +5.3% | ~12 秒 |
-| B（轴承 RUL） | 681.16 (RMSE) | **452.64** | -33.5% | ~30 秒 |
-| C（发动机 RUL） | 52.87 (RMSE) | **50.54** | -4.4% | ~90 秒 |
+| 任务 | 官方基线 | 本系统实测 | 相对基线 | 闸门结论 |
+|------|----------|------------|----------|----------|
+| A（气体识别） | 0.7140 (Macro-F1) | **0.7412** | +3.8% | ✅ 1/1 上线 |
+| B（轴承 RUL） | 681.16 (RMSE) | 458.48 / 467.64 / 486.06 | −32.7% / −31.4% / −28.6% | ❌ 0/3 回滚 |
+| C（发动机 RUL） | 52.87 (RMSE) | 92.86 / 262.45 / 101.12 | 未达标 | ❌ 0/3 回滚 |
+
+数字来源：官方基线取任务包 `training.json` 的 `validation_after`；实测取 `submission_runs/*/experiment_history.jsonl`。旧版本的 0.7519 / 452.64 / 50.54 / NASA 3.448e9 无法在当前镜像复现，已撤回。
 
 **测试环境**:
 - CPU: Intel Core i7-12700H
