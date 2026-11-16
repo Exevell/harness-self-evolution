@@ -108,7 +108,7 @@
 | 大模型单次决策 | 0.8～1.9 秒（Qwen3.5-4B，关闭 thinking） |
 | 内存 | < 1 GB（纯 NumPy，无深度学习框架） |
 | 磁盘 | 每轮检查点约 36 KB（B）/ 132 KB（A）；`experiment_history.jsonl` 每轮约 3～7 KB；另有 `round-NN/history.jsonl`（逐 epoch 记录，数十 KB） |
-| 镜像 | 单层，481,853,440 字节（未压缩 tar） |
+| 镜像 | 单层（amd64/linux），未压缩 `docker save` tar；实际字节数与 SHA256 以交付的 `harness-1.0.0.tar` 文件为准（本文档随镜像分发，故不写死自身尺寸，避免自指） |
 
 ---
 
