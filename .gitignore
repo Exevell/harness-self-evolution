@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+submission_runs/
+demo-output/
+.env
+*.tar
+*.tar.gz
