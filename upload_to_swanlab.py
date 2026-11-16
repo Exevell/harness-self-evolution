@@ -78,10 +78,11 @@ def upload_to_swanlab(history_file: Path, project_name: str = "industrial-model-
         strategy = record.get('strategy', {})
         
         # 基础指标
+        # SwanLab 只接受数值/布尔标量，字符串指标（策略名、样本权重方式）会被拒收，
+        # 因此只上传数值指标；策略名记录在 config 与文本摘要里。
         metrics = {
             f"{stage_id}/validation_rmse": record.get('validation_rmse', 0.0),
             f"{stage_id}/passed": record.get('passed', False),
-            f"{stage_id}/strategy_name": strategy.get('name', 'unknown'),
             f"{stage_id}/learning_rate": strategy.get('learning_rate', 0.0),
             f"{stage_id}/batch_size": strategy.get('batch_size', 0),
             f"{stage_id}/epochs": strategy.get('epochs', 0),
@@ -118,8 +119,7 @@ def upload_to_swanlab(history_file: Path, project_name: str = "industrial-model-
                 for bearing, bias in bias_per_bearing.items():
                     metrics[f"{stage_id}/bias_{bearing}"] = bias
         
-        # 策略参数
-        metrics[f"{stage_id}/sample_weight"] = strategy.get('sample_weight', 'none')
+        # 策略参数（只传数值）
         metrics[f"{stage_id}/gauss_aug"] = strategy.get('gauss_aug', 0.0)
         metrics[f"{stage_id}/cosine_anneal"] = strategy.get('cosine_anneal', False)
         metrics[f"{stage_id}/shrink_a"] = strategy.get('shrink_a', 1.0)
@@ -143,7 +143,7 @@ def upload_to_swanlab(history_file: Path, project_name: str = "industrial-model-
             print(f"  🏆 最优 RMSE: {best['validation_rmse']:.2f} ({best['stage_id']})")
         
         swanlab.log({
-            "best/strategy_name": best['strategy']['name'],
+            "best/strategy_index": best['strategy'].get('learning_rate', 0.0),
             "best/learning_rate": best['strategy']['learning_rate'],
             "best/batch_size": best['strategy']['batch_size']
         })
