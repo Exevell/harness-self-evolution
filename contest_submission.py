@@ -161,8 +161,7 @@ def train(rnd):
             metric, parent_metrics.get(metric, "n/a")))
 
     experiments = []
-    best = {"score": parent_score, "epochs": 0, "learning_rate": parent.meta["learning_rate"],
-            "metrics": parent_metrics, "bytes": None}
+    best = None  # 只从"真正续训过的候选"里选，父模型仅作基线对照，不作为提交产物
     for epochs, learning_rate in _plans(round_index):
         candidate = Model.load(checkpoint_path)
         candidate.meta["learning_rate"] = float(learning_rate)
@@ -175,7 +174,7 @@ def train(rnd):
         experiments.append({"epochs": epochs, "learning_rate": learning_rate,
                             "score": round(score, 6), "metrics": metrics})
         _log("候选 epochs=%d lr=%s -> %s=%s" % (epochs, learning_rate, metric, metrics.get(metric)))
-        if score > best["score"]:
+        if best is None or score > best["score"]:
             best = {"score": score, "epochs": epochs, "learning_rate": learning_rate,
                     "metrics": metrics, "model": candidate}
 
@@ -213,7 +212,7 @@ def train(rnd):
                 experiments.append({"epochs": epochs, "learning_rate": learning_rate,
                                     "score": round(score, 6), "metrics": metrics, "from_advice": True})
                 _log("建议候选 epochs=%d lr=%s -> %s=%s" % (epochs, learning_rate, metric, metrics.get(metric)))
-                if score > best["score"]:
+                if best is None or score > best["score"]:
                     best = {"score": score, "epochs": epochs, "learning_rate": learning_rate,
                             "metrics": metrics, "model": trial}
             except ValueError as error:
@@ -222,9 +221,17 @@ def train(rnd):
     work = _work()
     candidate_dir = work / ("candidate-r%02d" % round_index)
     candidate_dir.mkdir(parents=True, exist_ok=False)
-    if best.get("model") is None:
-        best["model"] = Model.load(checkpoint_path)
-        best["epochs"] = 0
+    if best is None:
+        # 极端兜底：至少完成一次可复现的续训，保证本轮产物一定是"训练过的检查点"，
+        # 不会与父检查点字节相同。
+        fallback = Model.load(checkpoint_path)
+        fallback.meta["learning_rate"] = 0.001
+        fallback.fit(x_train, y_train, 1)
+        score, metrics = _score(fallback, x_val, y_val, task, classes)
+        experiments.append({"epochs": 1, "learning_rate": 0.001, "score": round(score, 6),
+                            "metrics": metrics, "fallback": True})
+        best = {"score": score, "epochs": 1, "learning_rate": 0.001, "metrics": metrics,
+                "model": fallback}
     best["model"].save(candidate_dir / checkpoint_name)
 
     hypothesis = ("第 %d 轮：父模型 %s=%s，用 epochs/lr 网格在公开训练集续训并只在公开验证集上选择，"
@@ -233,13 +240,26 @@ def train(rnd):
                       % (best["epochs"], best["learning_rate"], metric,
                          parent_metrics.get(metric, "n/a"), best["metrics"].get(metric, "n/a")))
 
+    flat = {
+        "dataset_key": dataset,
+        "task": task,
+        "metric": metric,
+        "epochs": int(best["epochs"]),
+        "learning_rate": float(best["learning_rate"]),
+        "parent_metric_value": float(parent_metrics.get(metric, 0.0) or 0.0),
+        "candidate_metric_value": float(best["metrics"].get(metric, 0.0) or 0.0),
+        "experiments": len(experiments),
+        "train_rows": int(train_info["rows"]),
+        "validation_rows": int(val_info.get("rows", 0)),
+    }
+    if best["metrics"].get(metric) is None:
+        raise ValueError("candidate metric missing for %s" % metric)
+
     submitted = rnd.submit_candidate(
         candidate_dir,
         hypothesis=hypothesis,
         change_summary=change_summary,
-        configuration={"epochs": best["epochs"], "learning_rate": best["learning_rate"],
-                       "parent_metric": parent_metrics, "candidate_metric": best["metrics"],
-                       "experiments": experiments, "task": task, "dataset_key": dataset},
+        configuration=flat,
         seed=int(parent.meta["seed"]) + round_index,
         checkpoint_paths=[checkpoint_name],
         code_paths=[],
@@ -261,11 +281,8 @@ def train(rnd):
         reason=("依据本轮 %d 组候选在公开验证集上的实测 %s，以及模型 `%s` 的建议（call_id=%s）：%s。"
                 % (len(experiments), metric, rnd.model_name, receipt.call_id,
                    str(advice.get("reason") or "采纳实测最优，未采纳建议" ))),
-        configuration={"epochs": best["epochs"], "learning_rate": best["learning_rate"],
-                       "dataset_key": dataset, "task": task,
-                       "parent_metric": parent_metrics, "candidate_metric": best["metrics"]},
+        configuration=flat,
         seed=int(parent.meta["seed"]) + round_index,
-        history_ids=[item["id"] for item in history],
     )
 
 
@@ -290,10 +307,28 @@ def predict(sample, model_dir):
         _log("预测输入缺少 %d 个声明特征，已补 0" % missing)
     x = np.asarray([values], dtype=np.float64)
     if sample.task == "regression":
-        return {"value": max(0.0, float(model.predict(x)[0]))}
+        value = float(model.predict(x)[0])
+        if not math.isfinite(value):
+            value = 0.0
+        return {"value": max(0.0, value)}
     probabilities = model.predict(x)[0]
-    scores = [float(min(1.0, max(0.0, value))) for value in probabilities]
-    top = int(np.argmax(scores))
-    if sum(1 for value in scores if abs(value - scores[top]) < 1e-12) > 1:
-        scores[top] = min(1.0, scores[top] + 1e-6)
-    return [{"label": label, "score": round(score, 6)} for label, score in zip(model.meta["classes"], scores)]
+    scores = []
+    for value in probabilities:
+        value = float(value)
+        if not math.isfinite(value):
+            value = 0.0
+        scores.append(min(1.0, max(0.0, value)))
+    labels = list(model.meta["classes"])
+    if len(scores) != len(labels):
+        raise ValueError("class count mismatch")
+    rounded = [round(score, 6) for score in scores]
+    top = int(np.argmax(rounded))
+    if sum(1 for value in rounded if value == rounded[top]) > 1:
+        # 顶层并列必须消掉：优先抬高最优项，若已到 1.0 就把其余并列项压低。
+        if rounded[top] < 1.0:
+            rounded[top] = round(rounded[top] + 1e-6, 6)
+        else:
+            for index, value in enumerate(rounded):
+                if index != top and value == rounded[top]:
+                    rounded[index] = max(0.0, round(value - 1e-6, 6))
+    return [{"label": label, "score": score} for label, score in zip(labels, rounded)]
