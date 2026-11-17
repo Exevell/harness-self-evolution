@@ -95,9 +95,11 @@ if [ -z "${CHECKPOINT}" ] || [ -z "${TRAIN_JSONL}" ] || [ -z "${VAL_JSONL}" ] ||
 fi
 
 export HARNESS_BASELINES="${BASELINES}"
-mkdir -p "${OUTPUT_DIR}"
+mkdir -p "${OUTPUT_DIR}" 2>/dev/null || OUTPUT_DIR=/tmp/harness_output
+mkdir -p "${OUTPUT_DIR}" 2>/dev/null || true
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+LOG_FILE="${OUTPUT_DIR}/run.log"
 
 # ---------- 3) 跑自进化 ----------
 log "启动自进化..."
@@ -107,9 +109,17 @@ log "启动自进化..."
     --checkpoint "${CHECKPOINT}" \
     --train "${TRAIN_JSONL}" \
     --validation "${VAL_JSONL}" \
-    --output "${OUTPUT_DIR}"
-EXIT_CODE=$?
+    --output "${OUTPUT_DIR}" 2>&1 | tee "${LOG_FILE}"
+EXIT_CODE=${PIPESTATUS[0]}
 
 log "退出码=${EXIT_CODE}"
 log "实验记录=${OUTPUT_DIR}/experiment_history.jsonl"
-exit ${EXIT_CODE}
+
+# 失败时把关键报错回显到 stdout，避免平台只看到空输出
+if [ "${EXIT_CODE}" -ne 0 ]; then
+    log "运行失败，最后 30 行日志如下："
+    tail -n 30 "${LOG_FILE}" 2>/dev/null || true
+    exit "${EXIT_CODE}"
+fi
+
+exit 0
