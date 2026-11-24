@@ -71,7 +71,7 @@
 |---|---|
 | 模型 | **Qwen/Qwen3.5-4B**（平台白名单内的基础模型，`rnd.model_name` 由宿主下发） |
 | 调用方式 | 每轮至少 1 次 `rnd.model(messages, max_tokens, temperature=0)`；`finish.model_call_ids` 引用本轮真实回执号 |
-| 输入 | 本轮数据集代号、阶段、父/候选指标摘要、门槛判定结果、历史轮次摘要（**不含训练数据原文、不含检查点权重、不含密钥**） |
+| 输入 | 本轮数据集代号、阶段、父/候选指标摘要、实验元数据、历史轮次摘要（**不含训练数据原文、不含检查点权重、不含密钥**） |
 | 输出 | 一段决策说明（"为什么提交/保留"），写入 `finish.reason` 与 `hypothesis/change_summary`；**不参与前向预测、不写入检查点、不影响 `predict` 输出** |
 | 密钥 | PyTRiO Key 只由平台提交页保管；镜像、源码、文档、训练记录中均不含任何密钥 |
 
@@ -82,7 +82,7 @@
 | # | 声明 | 事实依据 |
 |---|---|---|
 | 1 | 未使用、未推断隐藏测试标签 | 赛题包内只挂载 `public/` 两个文件；隐藏集不进训练容器；本队未按文件名/样本号反推 |
-| 2 | 未读取桌面原始 CSV | 全部实验脚本只读 `work/a|b|c` 与赛题包 `public/`；XJTU-SY / C-MAPSS 原始目录从未被打开 |
+| 2 | 未读取桌面原始 CSV | 全部实验脚本只读 `work/a`、`work/b`、`work/c` 与赛题包 `public/`；XJTU-SY / C-MAPSS 原始目录从未被打开 |
 | 3 | 公开验证集不并入梯度训练 | 三个 `strategy.py` 只在 `train_rows`/`x_train` 上求梯度；val 只用于指标、选 epoch 与门槛 |
 | 4 | 父检查点真实续训 | `Model.load(父)` 后继续；保留 Adam 矩与归一化统计量；候选与父字节不同（A 已验收） |
 | 5 | 未重拟合归一化统计量 | A 实测重拟合会掉到 0.5221，因此三题一律沿用父检查点 `mean/scale` |
@@ -91,7 +91,7 @@
 | 8 | 不写 `/app`、不改 `/previous` | 候选/状态只在 `/workspace`（或 `tempfile` 目录）生成；`Model.save` 目标必须不存在 |
 | 9 | 不把密钥写入镜像/源码/文档 | 见 §5 |
 | 10 | 每轮至少 1 次真实大模型调用 | 快进轮也先调用再 `finish`；30/30 轮 `model_call_ids` 非空且为本轮真实回执 |
-| 11 | 实验记录可复算 | 逐轮 `start.frame.json`/`metrics.json`/`finish.record.json`、C 题 45 份逐 epoch 轨迹、B 题 23 份样本外预测缓存 |
+| 11 | 实验记录可复算 | `evidence/report-{a,b,c}.md`、`evidence/sim-app202-summary.md`、`evidence/round-history/{A,B,C}.jsonl` 随源码仓库提交，含逐轮帧摘要、逐 epoch 轨迹与 495 子集缓存汇总 |
 | 12 | 结果口径诚实 | 验证最优轮与固定末轮两个口径都报；val 选型偏差、小类不确定性、短轴承代价均在报告中披露 |
 
 ---

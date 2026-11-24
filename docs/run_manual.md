@@ -15,7 +15,7 @@
 | 文档 | `docs/technical_report.md`、`docs/source_declaration.md`、`docs/run_manual.md` | 本套材料 |
 | 实验结果 | 见技术报告 §6.6 | 逐轮帧、逐 epoch 轨迹、样本外预测缓存 |
 
-镜像内 `/app` 共 12 个文件（138.3 KiB）：`harness.py`(204 B)、`contest_submission.py`(24,825 B)、`run.sh`(393 B, 权限 0755)、`baselines/`（`__init__`、`data`、`model`、`predict`）、`strategies/`（`__init__`、`a_impl`、`b_impl`、`c_impl`、`core`）。
+镜像内 `/app` 共 12 个文件（138.3 KiB / 141,606 B）：`harness.py`(204 B)、`contest_submission.py`(24,825 B)、`run.sh`(393 B, 权限 0755)、`baselines/`（`__init__`、`data`、`model`、`predict`）、`strategies/`（`__init__`、`a_impl`、`b_impl`、`c_impl`、`core`）。
 
 ---
 
@@ -102,9 +102,11 @@ rnd.finish(
 ```powershell
 # 1) 准备打包用 /app：源码快照 + 去 __pycache__/.pyc + 最小 run.sh（LF、0755）
 #    final-app/ = app-final/ 去掉 SNAPSHOT.json、去掉 __pycache__，加 run.sh
-# 2) 以官方 1.0.0 镜像为底，单层重打包并自校验
-& $py -X utf8 repack_image.py --app-dir final-app --tags harness:1.0.0 --output harness-2.0.2.tar
+# 2) 以官方 1.0.0 镜像为底，只替换 /app，单层重打包并自校验
+& $py -X utf8 repack_image.py --image <原始 harness-1.0.0 镜像 tar> --app-dir final-app --tags harness:1.0.0 --output harness-2.0.2.tar
 ```
+
+> 本次实际使用的底镜像是 `harness-1.0.0-artfix.tar`（373.62 MiB，原层 `layer-759b466965a6`）；重打包后层为 `layer-84c872ea02fc`（373.23 MiB），保留原层载荷 13,259 个成员并逐条比对。
 
 `run.sh`（平台实际执行 `python3 /app/harness.py …`，该脚本只兼容原镜像 `Entrypoint`）：
 
@@ -142,6 +144,8 @@ exec sleep infinity
 > `$py` 为本机 Python 3.12 解释器路径（示例：`C:\Users\Administrator\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe`），按环境替换；线程固定为 2。
 
 ### 4.1 三题离线复现（只用赛题包 public 数据）
+
+> 以下路径相对开发工作树（`work/a|b|c`）。提交仓库中以 `evidence/` 存放冻结记录（见技术报告 §6.6），源码按 `contest_submission.py` + `strategies/` 复现同口径数字。
 
 ```powershell
 $env:BASELINE_CPU_THREADS="2"; $env:OMP_NUM_THREADS="2"
@@ -185,7 +189,7 @@ cd work\c
 cd work\harness
 $sdk102 = "<SDK 1.0.2 目录>"
 
-# 主证据：真实 /app × SDK 1.0.2 × 10 轮 × 3 数据集（约 4 min）
+# 主证据：真实 /app × SDK 1.0.2 × 10 轮 × 3 数据集（约 4–5 min）
 & $py -X utf8 platform_sim.py --app app-202 --sdk $sdk102 --datasets A B C --rounds 10 --runs-root runs-app202 --no-sdk-selftest
 
 # 空壳提交 + SDK 1.0.4（验证分块上传路径）
@@ -213,7 +217,7 @@ python3 /app/harness.py predict < samples.jsonl
 
 | # | 限制 | 影响 | 处置 |
 |---|---|---|---|
-| 1 | 仿真器只换 `stage_id`、不换公开投影 | 未在仿真里验证"换阶段一次性适配" | 用 §6.3 的三个模拟 stage 单独验证（首轮 −3.1%~−5.6%） |
+| 1 | 仿真器只换 `stage_id`、不换公开投影 | 未在仿真里验证"换阶段一次性适配" | 用技术报告 §6.3 的三个模拟 stage 单独验证（首轮 −3.1%~−5.6%） |
 | 2 | 仿真器模型调用是离线 stub | 未验证真实网关延迟与返回质量 | 协议层（每轮≥1 次真实调用、`model_call_ids` 非空）已验证；真实质量待试运行 |
 | 3 | RSS/耗时是本机相对参考 | 不能直接当正式环境数字 | 正式 2 vCPU 预算下 C 端到端 50.3–60.6 s、峰值 229 MiB，余量充足 |
 | 4 | Windows 无 chroot，只读权限未强制 | 本地写 `/app` 会"成功"，不能验证只读边界 | 代码层不写 `/app`；正式环境由平台强制 |
@@ -256,7 +260,7 @@ $py="…\python.exe"
 & $py work\b\step15_validate2.py
 & $py work\c\test_xy.py
 
-# 3) 平台协议 30 轮仿真
+# 3) 平台协议 30 轮仿真（$sdk102 见 §4.2，先 cd 到 work\harness）
 cd work\harness; & $py -X utf8 platform_sim.py --app app-202 --sdk $sdk102 --datasets A B C --rounds 10 --runs-root runs-app202 --no-sdk-selftest
 
 # 4) 镜像校验

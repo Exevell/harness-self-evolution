@@ -1,0 +1,877 @@
+# HAR-02 工业模型自进化系统 · 作品文档（队伍 070228）
+
+> 本文档包含三部分：**技术报告**（≤10 页）、**来源声明**、**系统运行说明**。
+
+---
+
+# 第一部分 · 技术报告
+
+# 智训引擎"工业模型自进化"技术报告
+
+**队伍 070228（北京印刷学院）｜版本 HAR-02｜日期 2026-11-24**
+
+> 一句话：本版把"每轮是否上线"做成一个**统计决策**——先在当轮公开验证集上复测父模型，候选必须跨过题级门槛才允许替换，否则原样保留父产物；再在"该学什么"上用三题各自的漂移归因决定候选池。结果是：同一公开验证集上 A +0.0419 macro-F1、B −33.9% RMSE、C −4.94% RMSE（NASA −53.5%），而本地平台协议仿真 30/30 轮通过、单轮最长 60.4 s、峰值内存 229.0 MiB。
+
+---
+
+## 0. 结论速览
+
+**口径说明（全文统一）**：本报告出现三种测量口径，互不混用——
+
+- **离线研究口径**：直接对赛题包 `public/` 数据调用策略函数（A 0.755890 / B 441.00 / C 50.258）；
+- **协议仿真口径**：经 `contest.harness.workspace.v2` 十轮端到端、候选产物落盘后再 `predict` 测得（A 0.755119 / B 450.316 / C 50.258）；
+- **平台口径**：A 0.8930 / B 379.46 / C 56.13（隐藏测试集，v7 试运行，详见 §8）。
+
+对外报数一律使用与场景匹配的口径：方法比较用离线口径、系统与协议结论用仿真口径、最终成绩用平台口径，不跨口径混用。
+
+| 评分项（权重） | 本版证据 | 详见 |
+|---|---|---|
+| 平均性能提升（15） | A 0.714030→0.755890（+0.0419）；B 681.160→450.316（−33.9%）；C 52.869→50.258（−4.94%）、NASA −53.5% | §5、§6 |
+| 最差阶段（5） | 门槛保证"不改进不上线"：C 的有序截断坏候选（54.24）被 1% 门限拦下并退回父模型 52.87 | §4.5、§6.3 |
+| 恢复速度（5） | 单轮一次性适配：模拟 stage 切换后首轮即 −3.1%~−5.6%；第二轮无提升则自动回 parent | §6.3 |
+| 稳定性（5） | 仿真 30/30 轮零失败、官方 prompt 重复 0/30；按门槛保留父模型：仿真 9/10，平台 v7 为 A 6/10、B 9/10、C 9/10；平台 0 次 `MODEL_CALL_REQUIRED`、30/30 `record_complete=true` | §6.4、§8.3 |
+| 资源效率（5） | 仿真峰值 RSS 45.9 / 51.4 / 229.0 MiB（上限 4 GiB）；平台 v7 逐轮 wall A 32.5–64.9 s / B 50.8–55.9 s / C 226.1–246.1 s，`training_seconds` 4,019.17 s、Token 51,843 | §7.1、§8.3 |
+| 自主决策与改进（10） | 两级自进化：模型层真实续训 + 策略层"候选池→门槛→回滚/快进"，决策与理由逐轮写进 `finish.reason` | §2、§4 |
+| 漂移检测（8） | A 类级质心证据、B 水平不可辨识负结果、C 尾部压缩分解，全部有数字 | §3 |
+| 路线选择（6） | 每题给出被否决路线的实测（CORAL 0.31、log1p、Huber、widen 等） | §5.4、§6.5 |
+| 安全控制（6） | 门槛+回滚+预算+确定性+只读边界，逐条对应上一版失败模式 | §4.4、§4.5 |
+| 系统质量 / 报告 / 受控实验 / 记录 / 记录驱动分析（6+6+5+5+5） | 仿真器 + 镜像 + 逐轮帧证据；A 31 配置网格、B 495 子集 LOBO、C 四子集留一 | §6、§7 |
+| 工业约束（4） | 2 vCPU/4 GiB 预算内、纯 numpy、不联网、检查点契约不变 | §1.4、§7 |
+
+---
+
+## 1. 赛题理解与约束
+
+### 1.1 问题设定
+
+平台在"漂移数据流"上对 A（气体识别，macro-F1）、B（轴承 RUL，RMSE 分钟）、C（发动机 RUL，RMSE 循环 + NASA 非对称分）各跑 10 轮。每轮容器内执行 `python3 /app/harness.py train`，stdin 收到一帧 `start`：本轮任务合同、**当前阶段的公开 train/validation 投影**、父检查点（含 `checkpoint_sha256` 绑定）与历史记录；选手在 `/workspace` 里从**父检查点续训**，经 `submit_candidate` 交候选、或 `finish(selected_artifact_id=父产物)` 保留父模型；`finish` 的 `model_call_ids` 必须非空且是本轮真实调用（SDK 文档明示）。隐藏测试按阶段评测平均提升、最差阶段、恢复速度、稳定性、资源效率。
+
+### 1.2 评分结构与本版的对应关系
+
+客观 35 = 平均性能提升 15 + 最差阶段 5 + 恢复速度 5 + 稳定性 5 + 资源效率 5；主观 65 = 自主决策 10 + 漂移检测 8 + 路线选择 6 + 安全控制 6 + 系统质量 6 + 技术报告 6 + 受控实验 5 + 实验记录 5 + 记录驱动分析 5 + 工业约束 4 + 答辩 4。本报告按此结构组织：§2/§4 对应自主决策与安全控制，§3 对应漂移检测，§5/§6 对应路线选择与受控实验，§6.6/§7 对应实验记录与工业约束。
+
+### 1.3 上一版为什么失败（必须说清楚）
+
+上一版（HAR-01）正式评测客观 **12.4576/35**（mean_gain 3.279/15、worst_stage 0.210/5、recovery 3.968/5、retention 5/5、resource 0/5），平台判定 5 项基础门槛中 3 项未过：`complete_materials_and_reproducibility=false`、`experiment_records_complete=false`、`not_below_static_baseline=false`。根因全部在代码层可查：
+
+| 根因 | 上一版事实 | 后果 | 本版机制 |
+|---|---|---|---|
+| 学习量不足 | 每轮只训 1–4 epoch，10 轮累计约 20 epoch，而父模型本身已训 15–20 epoch | 候选基本只是父模型的抖动，却仍被提交 | 每题按梯度步数/验证选轮配足训练量（A 约 1200 步、B 250 epoch×3 seed、C 600 epoch） |
+| 有序截断 | C 题 `TRAIN_CAP=12000` 把 113,089 行截成文件顺序前 12,000 行，`VAL_CAP=3000` 把 23,049 行截成前 3,000 行 | 有序子集分布偏斜→模型坍缩成常数；平台该段父模型 RMSE 43.09，我们十轮提交 55–58，**每轮都更差** | 取消一切行数截断，C 用满 113,089 / 23,049 行 |
+| 无回滚 | `best` 只在"训练过的候选"里选，兜底强制训练 1 epoch 后提交 | B 题 r5/r8/r10 候选比父模型差仍上线 | 每轮先在同一 val 上复测父模型，候选必须过门槛，否则 `selected=parent` |
+
+上一版在 A 题平台上第 1→10 轮公开验证 macro-F1 为 0.7257→0.9739，看似"越训越好"，实际是**阶段切换后 public train 变成了新 batch 的数据**；跨 stage 的绝对值不可比，只能比"同一投影下父 vs 子"。这条认识决定了本版的所有决策口径（§3.1、§6.2）。
+
+### 1.4 不可越过的硬约束
+
+| 约束 | 事实 | 本版做法 |
+|---|---|---|
+| 目录权限 | `/app`、`/data`、`/previous`、`/state`、`/model` 只读，只有 `/workspace`、`/tmp` 可写 | 候选与状态全部写 `/workspace`；不写 `/app`、不改 `/previous` 字节 |
+| 检查点契约 | `Model.load()` 校验 `hidden∈[1,128]`、`0<parameter_count<100000`、`learning_rate∈(0,1]`、`target_scale>0`、分类 `classes` 非空等 | 结构不动；B 的目标重定义只折叠进 `target_scale/target_mean`（§5.2） |
+| 数据边界 | 梯度更新只能用公开 train；公开 validation 只能用于测量/选型 | 三个 `strategy.py` 只对 train 求梯度，val 只算指标与门槛 |
+| 依赖 | 主流程数值栈只有 numpy（镜像另有 scipy/sklearn 供基础层使用，训练与预测不调用） | 全部策略纯 numpy、确定性、不联网、不 import 镜像外模块 |
+| 资源 | 正式评测 2 vCPU / 4 GiB / 10 GiB 临时盘 | 训练预算取 `min(0.40×wall, 180 s)`，实测峰值 229.0 MiB |
+| 每轮调用 | `model_call_ids` 非空且必须是本轮真实调用 | 快进轮也先做 1 次 `rnd.model()` 再 `finish`（§4.2） |
+
+---
+
+## 2. 系统架构：两层自进化闭环
+
+### 2.1 一轮的闭环（文字图）
+
+```
+        平台宿主（host_gateway_rpc）下发 start 帧
+        任务合同 / 公开 train·validation 投影 / 父产物 / state / wall_seconds
+                              │
+                              ▼
+        /app/harness.py describe | train | predict  →  contest_submission.py
+                              │
+        ┌─────────────────────┼──────────────────────────┐
+        ▼                     ▼                          ▼
+  投影 digest            策略层（本轮决策）            模型层（真实续训）
+  dataset|n_train|n_val   候选池 → 同一 val 父子对比     Model.load(父) 后继续
+  |ids|Σy                  → 门槛判定                    保留 Adam 一/二阶矩
+        │                     │                         与 mean/scale
+        ├ 相同且上轮 parent ──┤
+        │   → 1 次模型调用     ├ 过门槛 → selected=candidate（上传 /workspace 产物）
+        │   → finish(父产物)   └ 未过门槛 → selected=parent（产物字节不变）
+        │
+        ▼
+  finish(selected_artifact_id, reason, model_call_ids) → round_complete/round_ack
+                              │
+                              ▼
+        /state 写 digest / round / selected / history → 下一轮（或沿用上一份 state）
+```
+
+### 2.2 两层自进化的分工
+
+- **模型层**：只做"从父检查点真实续训"。三题各有一套训练器（噪声/类权重/dropout、目标仿射、余弦退火与验证选轮），但都不改网络结构、不新增特征、不重拟合归一化——A 题实测重拟合 `mean/scale` 会把 macro-F1 打到 0.5221，因此坚持沿用父检查点统计量。
+- **策略层**：只做"学不学、学完要不要"。候选池→父子对比→门槛→回滚/快进，是唯一能改变平台产物的决策点；它不依赖对隐藏测试的任何猜测。
+
+| 文件（交付源码） | 职责 |
+|---|---|
+| `contest_submission.py` | 接入层：解析 start 帧、投影 digest、预算、快进分支、`finish` 与 `reason` |
+| `strategies/__init__.py` | 候选驱动、按数据集分发、`is_better`/`better` 判定 |
+| `strategies/a_impl.py` | A 题候选池（plain / σ0.5 / σ0.8 + invfreq + dropout）与配对 bootstrap 门槛 |
+| `strategies/b_impl.py` | B 题寿命分数目标、`c=1000` 还原、3 seed 选优、IQR 守卫 |
+| `strategies/c_impl.py` | C 题全量续训、逐 25 epoch 选轮、NASA 守卫、分块计时早停 |
+| `baselines/` | 官方 NumPy MLP、数据适配、`predict`（未改语义） |
+
+决策可审计性：每轮把"用了哪些候选、各自在同一 val 上的指标、门槛判定式、最终选择"写进 `finish(configuration=…)`，把选择理由写进 `finish(reason=…)`，把本轮假设与相对父模型的改动写进 `hypothesis/change_summary`；`history_ids` 引用真实读过的历史记录，`model_call_ids` 引用真实模型调用。第三方仅凭 `/workspace` 产物、帧记录与 `state` 就能复算"为什么这一轮没有提交候选"。
+
+---
+
+## 3. 漂移监测与归因
+
+### 3.1 A：类别级协变量漂移，边界跨 batch 不可迁移
+
+A 的公开 train 是气体 batch1（445 行），validation 是 batch2（1,244 例）。父模型在 batch2 上 macro-F1 = **0.714030**，但 **Acetaldehyde 召回 = 0.000**：109 例中 108 例被判成 Ethanol、1 例判成 Toluene（F1=0 直接吃掉 macro-F1 的 1/6）。在父检查点的归一化空间里做质心距离：
+
+| 类 | 同气体 batch1→batch2 质心距离 | 最近的异类 batch1 质心 | 判定 |
+|---|---|---|---|
+| Acetaldehyde | 9.90 | **7.50（Ethanol）** | 自身更远→必然混类 |
+| Ethanol | 8.85 | 9.75（Acetaldehyde） | ok |
+| Ethylene | 7.47 | 11.24（Ammonia） | ok |
+| 其余三类 | 3.45–7.65 | 均大于自身距离 | ok |
+
+这不是整体平移：一阶 CORAL 到 0.3104、仅平移批均值到 0.6153，都比父模型更差；用 val 标签做 oracle logit 偏置的上界只有 **+0.0136**（0.7276），嵌套检验（一半 val 调偏置、另一半评）平均增益 **−0.0040**。结论：**batch2 的 Acetaldehyde 落进了 batch1 的 Ethanol 区域，任何用 batch1 标签训练的分类器都不可能召回它；唯一出路是新 batch 自己的标注数据**。这也解释了平台 A 题后期 0.9+ 的分数——那是阶段切换后 public train 换成了新 batch 数据，不是跨 batch 迁移的功劳。策略价值因此不在"修好 batch1→batch2"，而在"新数据到位就一次性适配，没适配好就不动"。
+
+### 3.2 B：绝对分钟在轴承间不可辨识（决定性负结果）
+
+B 的目标是 `RUL = D_b − i`（`D_b` = 整根轴承寿命分钟，跨 42–2,538 分钟、60 倍）。父模型在公开验证集 RMSE **681.160**、MAE 563.106，**比"验证集均值常数"465.55 还差 46%**。误差是 bias 而不是 shape：按轴承 bias 为 1_4 **+166.5**、2_4 **+326.3**、3_4 **−427.4**，预测 IQR/真值 IQR 只有 **0.26**（严重压缩）。留一根轴承（LOBO）直接暴露不可迁移性：D=2,538 的 3_1 被预测 60~209，D=371 的 3_3 被预测 941~1,211——**预测水平与 `D_b` 无关联**。因此任何"从特征预测寿命尺度"的路线都无信号，必须换目标（§5.2）。
+
+### 3.3 C：长寿命尾部被压缩，NASA 分数由 2.9% 样本决定
+
+父模型 RMSE 52.869 看似不差，但预测最大值只有 **298**，而验证集 RUL 最大 **434**；按 RUL 分箱，[300,400) 区间 bias −144.01、RMSE 150.76，[400,434] 区间 bias −213.21、RMSE 215.63。RUL>300 的 676 个样本只占 **2.9%**，却贡献 **94.3%** 的 NASA 非对称分；NASA_sum 5.823e9 中 97.15% 来自 TOP200 样本（175 个 FD004 + 25 个 FD003）。原因是容量/饱和与回归均值：32 个 tanh 单元 + 24 维原始特征到不了高 RUL 区。**任何"向均值收缩"的训练都会让 `exp(−err/13)` 指数级放大**——这正是上一版 C 在第 9/10 轮 NASA 爆到 1.4e10/1.7e10 的机制。
+
+### 3.4 监测信号与归因判据
+
+| 数据集 | 漂移类型 | 监测信号（每轮实时可算） | 归因判据 | 对策 |
+|---|---|---|---|---|
+| A | 类别级协变量漂移 | 父模型逐类召回、macro-F1、配对 bootstrap 差值分布 | 某类召回=0 且质心更靠近异类 | 类平衡 + 强噪声正则，只在新 batch 数据上适配 |
+| B | 目标尺度不可辨识 | 预测 IQR/真值 IQR、分轴承 bias、LOBO 子集 RMSE | IQR 比 <0.35、bias 随轴承符号翻转 | 目标换成寿命分数，单一先验还原 |
+| C | 尾部压缩 + 容量饱和 | 分箱 bias/RMSE、预测最大值、NASA 占比 | 高分位 bias 持续为负、NASA 由尾部主导 | 全量续训 + 验证选轮 + NASA 不回归守卫 |
+
+监测基础设施本身也是产品：每轮把投影 digest（`dataset|n_train|n_val|ids|Σy`）与 `history` 摘要写进 `/state`，下一轮据此判断"投影是否真的变了"；每轮的 `parent_metrics` 与候选指标都落进 `finish.configuration`，使任何一次上线/回滚都可被第三方复算。
+
+---
+
+## 4. 策略设计与受控机制
+
+### 4.1 父模型保留门槛（三题各自的可配置边际）
+
+| 数据集 | 指标方向 | 接受条件 | 设计依据 |
+|---|---|---|---|
+| A | macro-F1 ↑ | `gain ≥ 0.008`（n_val≥800，否则 0.020）**且** 配对 bootstrap `P(diff>0) ≥ 0.80` | 实测配对差 sd 0.008–0.022；0.008 ≈ 1 个 sd，可挡掉 +0.012 的假增益；P≥0.80 是第二道闸 |
+| B | RMSE ↓ | 相对改善 **≥5%** 且 `预测IQR/真值IQR ≥ 0.35` | 5% 挡住"换投影噪声"；IQR 比挡坍缩（父模型只有 0.26） |
+| C | RMSE ↓ + NASA | RMSE 改善 **≥1%** 且 **NASA 不回归** | LOBO 最坏退化 6.9%、正常轮改善 2–10%，1% 刚好分开；NASA 守卫防止尾巴做坏 |
+
+达不到条件时返回 `selected="parent"`，`selected_artifact_id = rnd.parent.artifact_id`，父产物字节不变。B 题守卫实测：把验证投影换成"只有短轴承 1_4"（父 242.0 vs 候选 577.7，gain −138.7%），正确返回 parent——这正是上一版 r5/r8/r10 该走的分支。
+
+本包（官方 public 投影）上三题的实际判定：A gain **+0.0419**、margin 0.008、配对 bootstrap **P=1.00** → candidate；B 相对改善 **33.9%**、IQR 比 **0.38** → candidate；C RMSE **−4.94%**、NASA **−53.5%** → candidate。仿真中第 2–10 轮的父模型已等于第 1 轮候选，候选在同一 val 上无法再 +5%/+1%/0.008，于是全部判 parent——门槛在"已经足够好"的投影上表现为**停止折腾**，这正是 10 轮决策应有的形态。
+
+### 4.2 相同投影快进（省预算，不省信息）
+
+对当前 train/validation 投影算 digest；若与上一轮相同、且上一轮已判定保留父模型，则本轮**只做 1 次真实模型调用**就 `finish` 父产物，`configuration.skipped="identical_projection"`。快进的合法性来自"上一轮已经在同一投影上做过全量搜索并证明无法超过父模型"，不重复消耗预算；快进轮不写 state（按 SDK 语义沿用上一份）。仿真中第 3 轮起生效：A 0.55–0.61 s/轮、B 1.05–1.09 s/轮、C 8.05–8.42 s/轮。
+
+### 4.3 预算与早停
+
+`train_budget = max(20, min(0.40×wall_seconds, 180) − 已用时)`：最多用当轮预算的 40%，给上传、模型调用与 `finish` 留 60%。C 题最重，按 25 epoch 分块检查墙钟，超过 `budget×0.85` 提前停并按已完成的轮次交付（正常机器永远走不到这个分支，行为确定）。
+
+### 4.4 安全与确定性
+
+- **数值安全**：纯 numpy、固定 seed、按 epoch 索引打乱（同输入同输出）；A 实测同参数两次 checkpoint 字节完全相同。
+- **文件安全**：候选写 `tempfile.mkdtemp()`/`/workspace` 新目录；`Model.save` 目标必须不存在，每轮先清空 `/workspace`；不写 `/app`、不改 `/previous`。
+- **传输安全**：候选 ≤64 文件 / 512 MiB，每轮累计 1 GiB，state 累计 512 MiB（SDK 限制）；上传期间不改文件。
+- **协议安全**：stdout 只写协议 JSONL，日志走 stderr/`log` 回调；`finish` 前不早退，收到 `round_ack.accepted=true` 才退出。
+
+### 4.5 上一版失败模式的机制性排除
+
+| 失败模式 | 机制 | 可验证证据 |
+|---|---|---|
+| 单轮劣化仍上线 | 门槛 + 回滚 | C 有序截断陷阱（前 300 行）候选 54.2354 → `selected=parent`、返回父模型 52.8686 |
+| 有序子集坍缩 | 取消截断 | C 训练 113,089 / 验证 23,049 行全量 |
+| 无信息重复搜索 | digest 快进 | 第 3 轮起 8 轮快进、每轮 1 次调用，30/30 轮通过 |
+| 超预算 | 40% 预算 + 分块早停 | 最长单轮 train 60.4 s（C 预算 230 s） |
+| 材料/记录不完整 | docs + 逐轮 JSON 证据 | §6.6 |
+| 协议/接入失败 | 真实子进程 + 完整 v2 帧仿真 | §6.4 |
+
+---
+
+## 5. 三题方法
+
+### 5.1 A：正则化适配（不是"把多数类刷得更准"）
+
+三个候选都从父检查点 clone 后续训：`fit-now-plain`（σ=0、无类权重、无 dropout，作对照）、`regularized-lite`（σ=0.5）、`regularized-strong`（σ=0.8），后两者带 **invfreq 类平衡 + 高斯噪声 + 通道 dropout 0.1**；每个候选约 1200 梯度步（445 行 ≈ 300 epoch），在 epoch 的 25/50/75/100% 取快照，落盘检查点与选型指标严格一致（差 0.00e+00）。组分消融（ep300、σ=0.8）：
+
+| 配置 | in-sample 最好 | 末 epoch | 样本外增益 | sd | P(>0) |
+|---|---|---|---|---|---|
+| 只加噪声（σ=0.8） | 0.7279 | 0.7203 | +0.0025 | 0.0086 | 0.57 |
+| 噪声 + invfreq | 0.7488 | 0.7240 | +0.0273 | 0.0137 | 1.00 |
+| **噪声 + invfreq + dropout** | **0.7553** | **0.7475** | **+0.0273** | 0.0195 | 0.95 |
+| 无噪声（inv+drop） | 0.7473 | 0.6307 | +0.0258 | 0.0192 | 0.90 |
+| 噪声 σ=1.2 + inv | 0.7295 | 0.6885 | −0.0019 | 0.0132 | 0.40 |
+
+噪声与 invfreq 必须成对：噪声单独不足以改变类先验（+0.0025，P=0.57）；而去掉噪声、只留 invfreq+dropout 会让模型在 batch1 上过冲，末 epoch 崩到 0.6307。多种子（4 个 epoch 打乱种子）σ0.8+inv+drop ep300 末 epoch 0.7348±0.0194，而 plain ep60 为 0.6614±0.0095——增益不是单次运气。
+
+### 5.2 B：把"不可辨识的水平"从损失里拿掉
+
+回归**寿命分数** `p = y/D_b`，用单一先验 `c` 还原分钟 `ŷ = c·p̂`；等价于目标仿射变换 `fit_target = c·y/D_b`，只改 `target_scale` 与 `target_mean`，**不改 `model.py`/`predict.py`**，预测仍以分钟输出。`D_b` 由训练标签推出（组内存在 RUL=0 行时 `max(y)+1`；片段则用快照号 `y+i` 精确还原，快照号只用于还原标签尺度、绝不进模型输入）。`c` 的决策：`c* = E[D]/(1+3σ_p²)`；12 根公开轴承 495 个"4 子集"的 `E[D]` 均值 1,468，理论 `c*≈1,184`，经验最优 900–1,100，取 **c=1000**（子集均值距最优仅 +0.3%，900–1,300 内误差 ≤7%，是平顶区）。训练对 `c` 不变（标准化抵消），`c` 是纯事后标量。
+
+| 方案 | 子集均值 | p90 | 最差单根 | worst-bearing |
+|---|---|---|---|---|
+| 父配方 15ep（绝对分钟） | 947 | 1,300 | 1,406 | 3_2 |
+| 绝对分钟 250ep cosine | 944 | 1,268 | 1,398 | 3_1 |
+| 分数 60ep | 683 | 1,027 | 1,155 | 3_2 |
+| **分数 250ep lr3e-3** | **654** | **980** | **1,104** | 3_2 |
+| 分数 600ep | 724 | 1,235 | 1,398 | 3_2 |
+| 分数 hidden 128 | 751 | 1,195 | 1,351 | 3_2 |
+
+换目标是唯一"量级级"的改进（947→654，−31%）；训练量 250ep 最优，600/1200ep 在没见过的轴承上更差（过拟合）；Huber（711）与按轴承加权（655/663）都在噪声内；拓宽 hidden 有害（751/738）。
+
+### 5.3 C：全量续训 + 验证选轮 + NASA 守卫
+
+配置：全量 113,089 行、batch 256、MSE、cosine 3e-3→1e-6、600 epoch，从父检查点续训；每个候选轮（每 25 epoch）在 public validation 上算 RMSE/MAE/NASA，取"**NASA 不回归前提下 RMSE 最小**"的 epoch（本次 e310）。权衡点是长寿命加权：`y>125×2` 能把 NASA 再降到 2.10e9（−64%），代价 RMSE 51.309（相对父模型仍 −2.95%）。题面主指标是 RMSE，默认取无加权；保留"NASA 不回归"作为硬门限，所以既拿到 RMSE 增益又不会重演 NASA 爆炸。
+
+### 5.4 被实测否决的结构性路线（路线选择的依据）
+
+| 路线 | 实测 | 结论 |
+|---|---|---|
+| hidden 32→128 零填充拓宽（A） | 与不拓宽在训练轨迹上逐位等价（差 0.000e+00）；表面增益来自顺带重置 Adam 矩 | 默认关闭，`n_train≥1500` 才作额外候选 |
+| hidden 24/32→128（B/C） | LOBO 751/738 vs 24 宽 654；C 上 4× 慢且不更强 | 否决 |
+| C 的 log1p 目标 | 无法逆变换（`predict` 无钩子）→不可部署；即便强行也负收益（RMSE 51.848） | 否决并单列声明 |
+| C 的 Huber / 尾部事后微调 | Huber 只改善 MAE；600ep 后再加权微调 → RMSE 53.39、NASA 1.34e10 | 否决 |
+| B 的 log1p/sqrt/幂目标、逐轴承特征 | 前者不可部署；后者题面禁止作模型输入 | 否决 |
+| A 的无监督对齐 | CORAL 0.3104、批均值 0.6153、重拟合 mean/scale 0.5221 | 否决（比父模型更差） |
+
+---
+
+## 6. 实验设计与结果
+
+### 6.1 A：31 配置网格 + 样本外遴选
+
+A 用 31 个配置（batch1 训练 → batch2 评测）做配方网格；因为"在 val 上挑最好 epoch"本身是一次 val 拟合，最终结论改用 **20 次随机半分割**（一半 val 挑 epoch、另一半评，与父模型配对比较，得 40 个样本外增益样本）：
+
+| 口径 | 数值 | 说明 |
+|---|---|---|
+| 父模型复现 | 0.714029722（与 `training.json` 逐位相同） | 复现偏差 0.00% |
+| 验证集实测 | 0.714030 → **0.755890（+0.0419）** | 候选池 + 快照点选型，偏乐观 |
+| 配对 bootstrap | 差 +0.0413，CI95 [+0.0187, +0.0732]，P(diff>0)=1.00 | 配对比较消掉共享样本噪声 |
+| **样本外半分割（推荐判据）** | **+0.0273 ± 0.0195，P=1.00** | 对"挑 epoch"过拟合免疫 |
+| 平台仿真端到端 | 0.714030 → **0.755119**（+4.11 pt） | 与离线复测差 0.0008，远小于同配方多种子 sd 0.0194 |
+| 不做门槛时的最坏情况 | −0.07 ~ −0.12 | 这就是必须保留 `selected=parent` 的原因 |
+
+### 6.2 B：495 个"隐藏 4 根"子集仿真的 LOBO
+
+主协议是样本外：9 根训练轴承逐根留出 + 3 根验证轴承，共 12 根；对全部 C(12,4)=495 个 4 根子集按行加权算 pooled RMSE，报子集均值/p90/最差子集与 worst-bearing。上表 §5.2 已给主结果：**947 → 654（−31%）**，worst-bearing 1,406 → 1,104，macro-bear 716 → 496。上线实现（seed 选优 + epoch 缩放）在同一公开 val 上实测 **450.316（−33.9%）**，MAE 563.106→337.5，IQR 比 0.26→0.38（过 0.35 守卫）；离线候选口径为 441.00（−35.3%），两者差 2.1%，都远优于父模型，报告以 450.316 为交付口径。等价常数 RMSE 465.55：候选 450.316 优于常数 3.3%——这是"没有低于静态基线"的直接反证。
+
+### 6.3 C：固定末轮 vs 验证最优轮，以及四子集/阶段切换
+
+| 口径 | RMSE | MAE | NASA_sum | 相对父模型 |
+|---|---|---|---|---|
+| 父模型 | 52.869 | 38.900 | 5.823e9 | — |
+| **验证最优轮（e310，交付）** | **50.258** | **36.010** | **2.709e9** | −4.94% / −53.5% |
+| 固定末轮（最保守部署口径） | 50.435 | 35.831 | 4.20e9 | −4.61% / −27.9% |
+| 长寿命加权 y>125×2（备选） | 51.309 | 38.022 | 2.10e9 | −2.95% / −64% |
+
+四个 FD 子集 RMSE 全部改善：FD001 −8.73%、FD002 −2.88%、FD003 −12.10%、FD004 −2.94%，不存在"用 A 子集换 B 子集"。阶段切换用三个模拟 stage 直接喂 `train_and_select_xy` 验证：首轮候选 −3.1% ~ −5.6%，第二轮无进一步提升时自动退回 parent（两个模拟 stage 的第二轮均判 parent）。留一子集（LOBO）显示最坏退化 +6.9%，正是"1% 门限 + parent 回退"必须存在的量级证据。
+
+### 6.4 平台协议仿真：30 轮端到端
+
+用真实子进程 + 真实文件挂载 + 完整 `contest.harness.workspace.v2` 帧（SDK 1.0.2 内联上传路径），跑 3 数据集 × 10 轮：
+
+| 数据集 | 第 1 轮候选（选中） | 第 2–10 轮 | 最长单轮 train | 峰值 RSS | 候选字节 |
+|---|---|---|---|---|---|
+| A | 0.755119（+4.11 pt） | 全部 parent | 3.5 s | 45.9 MiB | 129.1 KiB |
+| B | 450.316（−33.9%） | 全部 parent | 5.7 s | 51.4 MiB | 35.6 KiB |
+| C | 50.258（−4.94%） | 全部 parent | 60.4 s | 229.0 MiB | 28.2 KiB |
+
+30/30 轮通过：无 `round_failed`、无 RPC 乱序、无上传摘要错误；父检查点公开验证指标复现偏差 **0.00%**；官方 prompt 被重复塞进消息 **0/30**；`predict` 协议校验全通过（分类每行一条输出、分数∈[0,1]、最高分唯一；回归为非负有限数）。合计 train 216.0 s + 测量 6.3 s = 222.3 s。
+
+### 6.5 诚实口径（哪些数字偏乐观）
+
+1. **A 的 0.755890 含 val 选型**：配方本身是在同一 val 上选的，保守预期是样本外 **+0.010 ~ +0.025**。
+2. **C 用验证最优轮**：600 个候选里挑 1 个，估计偏差 0.1–0.2 RMSE；固定末轮 50.435 仍显著优于父模型，所以即使选型不泛化也保底。
+3. **B 用 LOBO 而非 val 选型**：val 只有 3 根轴承、90.2% 的行是 3_4，跨 stage 绝对值不可比，因此选型一律看 LOBO。
+4. **小类不确定性**：A 的 Toluene 验证集只有 5 例，单例翻转就能让 macro-F1 跳 ±0.028~0.056；Acetaldehyde 的 0.000→0.053 只是 3/109 个样本被救回，不改变"该类不可学"的判断。
+5. **B 短轴承被刻意牺牲**：`c=1000` 对 D=42 的轴承就是 20× 高估，1_4/2_4 单根差于其常数；整体赢在长轴承（3_4：423.6 vs 常数 437.3），而隐藏 4 根通常含长轴承。
+6. **仿真器不换投影**：30 轮里 public 投影不变，只验证了协议/资源/快进；"换阶段一次性适配"由 §6.3 的三个模拟 stage 单独验证，不是仿真器的结论。
+7. **平台口径已单列（v7）**：隐藏集 A 0.8930 / B 379.46 / C 56.13 与公开集差异明显（§8.1）；上述 1–6 条仍以离线/仿真口径表述，不把公开集数字当作隐藏集预期。
+
+### 6.6 实验记录与复现材料（对应材料/记录门槛）
+
+| 位置（随源码仓库提交） | 内容 |
+|---|---|
+| `evidence/report-a.md` | A 题完整实验表：31 配置网格、漂移诊断（质心/偏置上界/无监督对齐）、样本外半分割与配对 bootstrap |
+| `evidence/report-b.md` | B 题完整实验表：495 个"随机 4 根"子集 LOBO、`c` 扫描、分轴承偏差、上线守卫实测 |
+| `evidence/report-c.md` | C 题完整实验表：600 epoch 网格、逐 epoch 验证轨迹、固定末轮 vs 最优轮、FD 子集与留一子集 |
+| `evidence/sim-app202-summary.md` | 协议仿真 30 轮汇总：逐轮 train wall、峰值 RSS、selected、父/候选指标 |
+| `evidence/round-history/{A,B,C}.jsonl` | 三数据集逐轮决策与指标历史（哪一轮训练了什么、门槛判定、为何提交或保留父模型） |
+| `docs/technical_report.md`、`docs/source_declaration.md`、`docs/run_manual.md` | 本套材料 |
+| `contest_submission.py`、`strategies/`、`baselines/` | 交付源码（与镜像 `/app` 同源） |
+
+证据文件随源码仓库提交，镜像与文档中的数字均可由这些文件与 `docs/run_manual.md` 复现。
+
+---
+
+## 7. 资源效率与工程实现
+
+### 7.1 实测资源
+
+| 数据集 | 单轮预算（仿真 wall_seconds） | 最长单轮 train | 快进轮耗时 | 峰值 RSS | 正式环境上限 | 候选字节 |
+|---|---|---|---|---|---|---|
+| A | 180 s | 3.5 s（全量轮） | 0.55–0.61 s | 45.9 MiB | 4 GiB | 129.1 KiB |
+| B | 150 s | 5.7 s（全量轮） | 1.05–1.09 s | 51.4 MiB | 4 GiB | 35.6 KiB |
+| C | 230 s | 60.4 s（全量轮） | 8.05–8.42 s | 229.0 MiB | 4 GiB | 28.2 KiB |
+
+C 的单 epoch 0.094 s，600 epoch ≈ 56 s，端到端 50.3–60.6 s（占预算 ≤27%）；即使容器慢 2× 也只有 110–125 s。全程 `BASELINE_CPU_THREADS=2`、`OMP_NUM_THREADS=2`，同一时刻最多 1 个 train/predict 子进程。
+
+### 7.2 镜像
+
+| 项 | 值 |
+|---|---|
+| 文件 | `harness-2.0.2.tar`（`docker save`，linux/amd64，单层扁平） |
+| 字节 / 摘要 | **391,372,800 B**；sha256 `56456163261a77242b0a3c1325d0938b8510e6888beacebc034767c2204e8240` |
+| Tag / 层 | `harness:1.0.0`；layer `84c872ea02fc…` 的 sha256 == `config.rootfs.diff_ids[0]` |
+| `/app` | 12 个文件 / **138.3 KiB（141,606 B）**：`harness.py`(204 B)、`contest_submission.py`(24,825 B)、`run.sh`(393 B, 0755)、`baselines/`(4)、`strategies/`(5) |
+| 卫生 | 无 `__pycache__`、无 `.pyc`、无 SDK 副本；`run.sh` 为 LF |
+| 运行时 | Python 3.12.4 + numpy 1.26.4（镜像内另有 scipy 1.17.1 / scikit-learn 1.9.1 / swanlab 0.10.5，主流程未依赖） |
+| SDK | 镜像内 `contest_harness 1.0.2`；`describe` 输出 `sdk_version:"1.0.2"` |
+
+镜像自检：结构硬校验失败 0、警告 3（Windows 解包无法建 822 个符号链接，属本机限制）、通过 22；`describe` 在 `subst` 挂载 + bridge 下返回合法 JSON。
+
+### 7.3 仿真器的能力与边界（判断可信度时对照）
+
+| 能力 | 说明 |
+|---|---|
+| 真实容器行为 | 真实子进程 `python <盘符>:\app\harness.py train`；`/app`、`/data`、`/previous`、`/state`、`/model`、`/workspace` 经 `subst` 真实落盘 |
+| 完整协议 | 两代上传协议（1.0.2 内联 / 1.0.4 分块）；候选测量由宿主用 `predict_argv` 真跑完整 validation |
+| 逐轮证据 | 每轮帧、指标、`finish` 记录、stderr 全落盘；父绑定/摘要/引用校验与真实宿主同规则 |
+| 边界 | 只换 `stage_id` 不换投影；模型调用是离线 stub；RSS/时间是本机相对参考；只读权限未强制 |
+
+### 7.4 工程实现要点
+
+- **纯 numpy 与确定性**：主流程只 import numpy 与标准库；随机性只来自 `seed` 与 epoch 索引（`SeedSequence([seed, model.meta["epochs"]])`），同输入同输出。A 题已验收"同参数跑两次，checkpoint 字节完全相同"。
+- **零 stdout 污染**：所有日志走 `log` 回调（默认 stderr），stdout 只留协议 JSONL，避免宿主解析失败。
+- **不会写到不存在的目录**：每轮先建 `/workspace/<round>/` 新目录；`Model.save` 前断言目标不存在；状态先复制再改（`rnd.state_workspace`）。
+- **失败即回滚**：候选上传/测量异常一律退回 `selected=parent`，不让"半成品"占住产物位；C 题分块早停返回已完成轮次而不是报错。
+- **可移植**：路径一律走 `rnd.parent.path()`/`public_projection`，不写死 `/previous/checkpoint.npz`；不依赖 `/app` 可写。
+
+---
+
+## 8. 平台试运行结果（v7）
+
+> 回执 run `d1b5ce88…`，提交版本 v7，2026-11-24，status=completed，30/30 轮记录完整。本节只写平台回执数字；平台本轮未给出客观分预览（`objective_result=null`），因此不推算任何小分。
+
+### 8.1 最终指标：隐藏测试集 vs 公开验证集
+
+| 数据集 | 隐藏测试集（平台口径，最终评测同口径） | 公开验证集（平台逐轮测量，末轮选中产物） |
+|---|---|---|
+| A · macro-f1 ↑ | **0.8930144557**（accuracy 0.9009414654；prediction_count 4,886） | 0.9734669617（accuracy 0.9819121447） |
+| B · RMSE ↓ | **379.4630488**（MAE 259.7374818） | 449.7105103（MAE 336.5738305） |
+| C · RMSE ↓ | **56.13319424**（MAE 40.25593446；NASA 1.3244639189986775e11） | 50.79774168（MAE 36.53115966；NASA 1.2652408868649157e10） |
+
+**必须写明的差异**：隐藏测试集与公开验证集差异明显（A 0.9735→0.8930、B 449.7→379.5、C 50.80→56.13 且 NASA 1.27e10→1.32e11），说明公开集不能替代隐藏集，本文所有策略决策仍只用公开集。也正因如此，§0 把平台口径单列，不与离线/仿真口径混用。
+
+### 8.2 逐轮决策（父模型 → 候选，平台公开验证口径）
+
+**A（macro-f1 ↑）**
+
+| 轮 | 父模型 | 候选 | 判定 |
+|---|---|---|---|
+| 1 | 0.714030 | 0.755119 | 采纳（candidate） |
+| 2 | 0.755119 | 未超越 | parent |
+| 3 | 0.739598 | 0.946537 | 采纳（stage-02） |
+| 4 | 0.946537 | 未超越 | parent |
+| 5 | 0.944480 | 未超越 | parent |
+| 6 | 0.944658 | 未超越 | parent |
+| 7 | 0.828515 | 0.985285 | 采纳（stage-05，漂移后单轮恢复） |
+| 8 | 0.932289 | 0.985547 | 采纳 |
+| 9 | 0.985359 | 未超越 | parent |
+| 10 | 0.973467 | 未超越 | parent（末轮选中产物 = 0.973467） |
+
+**B（RMSE ↓）**
+
+| 轮 | 父模型 | 候选 | 判定 |
+|---|---|---|---|
+| 1 | 681.160 | 450.316 | 采纳（candidate） |
+| 2 | 450.316 | 未超越 | parent |
+| 3–4 | 沿用 | — | 快进 skip（`identical_projection`） |
+| 5 | 450.220 | 未超越 | parent（stage-02） |
+| 6–7 | 沿用 | — | 快进 skip |
+| 8 | 449.711 | 未超越 | parent（stage-03） |
+| 9–10 | 沿用 | — | 快进 skip |
+
+**C（RMSE ↓）**
+
+| 轮 | 父模型 | 候选 | 判定 |
+|---|---|---|---|
+| 1 | 52.869 | 50.669 | 采纳（训练被预算守卫截到 150 epoch） |
+| 2 | 50.669 | 未超越 | parent |
+| 3 | 沿用 | — | 快进 skip |
+| 4 | 50.651 | 未超越 | parent（stage-02） |
+| 5–6 | 沿用 | — | 快进 skip |
+| 7 | 50.449 | 未超越 | parent（stage-03） |
+| 8 | 沿用 | — | 快进 skip |
+| 9 | 50.798 | 未超越 | parent |
+| 10 | 沿用 | — | 快进 skip |
+
+### 8.3 资源、协议与门槛行为
+
+- 训练总时长 `training_seconds` **4,019.17 s**；Token：prompt 38,243 / completion 13,600 / 合计 **51,843**。
+- CPU seconds：A **2,204.55**、B **681.30**、C **3,957.62**。
+- 逐轮 wall（含平台开销）：A 32.5–64.9 s、B 50.8–55.9 s、C 226.1–246.1 s，均低于当轮预算。
+- `selected=parent`：A **6/10**、B **9/10**、C **9/10**；**0 次 `MODEL_CALL_REQUIRED`、0 次协议错误、30/30 `record_complete=true`、`usage_settled=true`**。
+- 门槛行为与设计一致：三题都是首轮采纳，其后只有在漂移后父模型被重新测量、且候选跨过题级门槛时才采纳（A 在 r3/r7/r8 采纳，B 仅 r1，C 仅 r1）；快进只出现在"投影未变 + 上一轮已判 parent"之后（B r3–4、r6–7、r9–10；C r3、r5–6、r8、r10）。
+- 同一投影内的门槛示例：C 的 r7 父模型重测为 50.449，候选未能再改善 1%，判 parent；B 的 r5/r8 父模型重测为 450.220/449.711，候选未达 5%，判 parent。这说明门槛在"父模型本身已经很好"的阶段表现为停止折腾，而不是硬提交。
+
+### 8.4 与 §6.4 协议仿真的对照及差异原因
+
+| 项 | §6.4 协议仿真 | v7 平台试运行 |
+|---|---|---|
+| 轮次与记录 | 30/30 通过 | 30/30 `record_complete=true` |
+| 首轮候选 | A 0.755119 / B 450.316 / C 50.258 | A 0.755119 / B 450.316 / C 50.669 |
+| 父→子决策形态 | 首轮采纳、其余 parent、快进生效 | 同（首轮采纳、多数 parent、快进仅在投影未变后触发） |
+| 协议错误 | 0 | 0 |
+
+差异原因：①仿真器只换 `stage_id`、不换公开投影（§7.3），因此它只能验证协议、资源与门槛逻辑，无法复现平台"换 stage 后父模型被重新测量、指标跳变"（A 的父模型在 10 轮内于 0.714–0.985 之间跳）；②平台 C 的 r1 训练被预算守卫截到 150 epoch（50.669），离线 600 epoch 为 50.258，"预算换稳定"是预期行为，不是回归；③平台 wall 含平台开销（C 226–246 s/轮），比本机仿真（最长 60.4 s）长，但低于 C 的当轮预算。在同一投影的可比首轮上，仿真与平台完全一致（A 0.755119、B 450.316）。
+
+### 8.5 本轮未给出的项
+
+平台本轮 `objective_result=null`，未提供客观分预览（平均提升 / 最差阶段 / 恢复速度 / 稳定性 / 资源效率的小分），本节不推算；相应机制证据见 §4、§6、§7。
+
+---
+
+## 9. 局限与后续
+
+1. **A 的小类上限**：Acetaldehyde 在 batch1 上不可分，macro-F1 对它是等权重的，这一项上限约 +0.167；Toluene 只有 5 例时任何结论都不精确。
+2. **B 的 `c` 是先验**：若隐藏 4 根以长寿命为主（`E[D]≈2200`），`c=1000` 会欠预测；按 §5.2 的扫描，`c=1500` 使子集均值 +16%。建议在能判断隐藏集含 ≥2 根 2,000 分钟级轴承时上调到 1,300–1,500。
+3. **C 的选型乐观偏差**：交付口径用验证最优轮，固定末轮 50.435 是保底；NASA 长尾仍集中在 RUL>300（候选仍有 78% 分数来自该段），若隐藏分布更偏长寿命需切到加权配置。
+4. **仿真器的局限**：没有验证"换阶段后一次性适配"的完整链路（用三个模拟 stage 替代），也没有验证真实网关的模型延迟与返回质量。
+5. **恢复速度与稳定性的现实约束**：本版每个阶段只靠"首轮一次性适配 + 后续保留"拿分，若某个阶段只有 1 轮且该轮恰好判 parent，恢复速度分只能靠父模型本身；反之若阶段有 3–4 轮，第二轮起都是"零风险"的快进轮。稳定性同理：9/10 轮保留父模型的代价是"不涨分"，收益是"不跌分"，这在最差阶段与 retention 两项上更划算。
+6. **后续**：①平台试运行回填后复核三题门槛是否过严/过松（尤其 A 的 0.008 对 n_val<800 的投影）；②若恢复速度分不理想，把"快进"扩成"投影变了但历史证据足够时也先做小候选池"；③把 §6.5 的诚实口径写进答辩材料，避免把 val 选型数字说成隐藏测试预期。
+
+---
+
+## 10. 合规与来源声明摘要
+
+- **数据**：只使用平台下发的 `cpu-a|b|c-guide-20261110-v1` 包内 `public/train.jsonl`、`public/validation.jsonl` 与 `checkpoint.npz`；未读取桌面原始 CSV（XJTU-SY / C-MAPSS），未获取、未推断隐藏测试标签，未联网。
+- **训练边界**：梯度更新只在公开 train 上；公开 validation 只用于测量、选 epoch 与门槛判定，绝不并入梯度。
+- **父检查点**：三题都是从 `Model.load(父)` 续训（保留 Adam 一/二阶矩与 mean/scale），未重新初始化；A 的 hidden 拓宽为函数保持迁移且默认关闭。
+- **大模型**：每轮至少 1 次 `rnd.model()` 真实调用（Qwen/Qwen3.5-4B，平台白名单），只用于生成决策说明，不参与前向预测、不进检查点、不影响 `predict` 输出。
+- **提交件**：镜像 `harness:1.0.0`（sha256 见 §7.2）、源码、本报告与 `source_declaration.md` / `run_manual.md`。
+
+完整来源、许可与合规清单见 [`source_declaration.md`](source_declaration.md)；运行与复现见 [`run_manual.md`](run_manual.md)。
+
+---
+
+## 11. 附：实验记录链接与镜像摘要
+
+| 项 | 值 |
+|---|---|
+| 源码仓库 | `https://github.com/Exevell/harness-self-evolution` |
+| SwanLab 项目 | `https://swanlab.cn/@070228Ggx/harness-self-evolution`（具体 run 链接待补） |
+| 镜像文件 | `harness-2.0.2.tar`（linux/amd64，单层扁平） |
+| 大小 | **391,372,800 B**（373.24 MiB） |
+| sha256 | `56456163261a77242b0a3c1325d0938b8510e6888beacebc034767c2204e8240` |
+| Tag | `harness:1.0.0` |
+| 内置 SDK | `contest_harness` 1.0.2 |
+| 实验记录 | `evidence/report-{a,b,c}.md`、`evidence/sim-app202-summary.md`、`evidence/round-history/{A,B,C}.jsonl` |
+
+
+---
+
+# 第二部分 · 来源声明
+
+# 来源声明与合规清单
+
+**队伍 070228（北京印刷学院）｜版本 HAR-02｜日期 2026-11-24｜对应提交件 `harness-2.0.2.tar`（tag `harness:1.0.0`）**
+
+本文件说明本作品使用的数据、模型、第三方组件与大模型服务来源，并逐条声明赛规要求的数据隔离与合规边界。技术细节见 [`technical_report.md`](technical_report.md)，运行方式见 [`run_manual.md`](run_manual.md)。
+
+---
+
+## 1. 数据集来源与许可
+
+三个数据集均由组委会赛题包下发（`cpu-a-guide-20261110-v1`、`cpu-b-rul-20261110-v1`、`cpu-c-guide-20261110-v1`），包内只有 `public/train.jsonl`、`public/validation.jsonl`、`checkpoint.npz`、`training.json`、`history.jsonl` 与基线代码。本队**未修改赛题包任何文件**。
+
+| 数据集 | 公开来源 | 原始形态 | 引用与使用边界 |
+|---|---|---|---|
+| A · 气体识别 | UCI Machine Learning Repository **#224** *Gas Sensor Array Drift at Different Concentrations*（128 维 = 16 传感器 × 8 特征，6 类气体） | 原始数据文件 + 批次标注 | 按 UCI 仓库页面声明（CC BY 4.0）引用；本队只使用平台下发的 JSONL 投影，未下载、未再分发原始数据 |
+| B · 轴承 RUL | **XJTU-SY** 滚动轴承加速寿命试验数据集（西安交通大学，王彪、雷亚国等公开） | 原始振动 CSV（按分钟快照） | 引用原始论文（Wang B., Lei Y., Li N., Li N., *A hybrid prognostics approach for estimating remaining useful life of rolling element bearings*, IEEE Trans. Reliability, 2020）；公开供研究使用，本队未读取原始 CSV、未再分发 |
+| C · 发动机 RUL | **NASA C-MAPSS** 涡扇发动机退化仿真数据（FD001–FD004，NASA Prognostics Center of Excellence） | 原始 train/test/RUL txt | 引用 Saxena A., Goebel K., Simon D., Eklund N., *Damage propagation modeling for aircraft engine run-to-failure simulation*, PHM 2008；本队只使用平台 JSONL 投影 |
+
+**说明**：为避免任何"用外部数据补隐藏测试"的嫌疑，本队**从未打开**桌面上存放的 XJTU-SY / C-MAPSS 原始 CSV 目录；所有训练、诊断、选型只发生在赛题包 `public/` 投影上。任务包内出现的轴承只有公开的 12 根（`Bearing1_1`…`3_4`），平台未公开的隐藏轴承从未出现在任何本地实验中。
+
+---
+
+## 2. 模型来源与改动
+
+基础模型全部是**组委会任务包自带**的 CPU NumPy MLP（`baselines/model.py`，`contest.cpu-mlp.v1` 格式、Adam、`npz` 无 pickle），父检查点为包内 `checkpoint.npz`。
+
+| 任务 | 结构 | 参数量 | 本版改动 | 合规性 |
+|---|---|---|---|---|
+| A | 128 → 32 tanh → 6 softmax | 4,326 | 不改结构；只改训练过程（invfreq 类平衡、高斯噪声、通道 dropout、快照选型） | ✅ 续训合同允许 |
+| B | 34 → 24 tanh → 1 linear | 865 | 不改结构；目标改为寿命分数 `c·y/D_b`，**只折叠进 `target_scale/target_mean`**，`model.py`/`predict.py` 一行未改 | ✅ 检查点格式兼容，预测仍以分钟输出 |
+| C | 24 → 32 tanh → 1 linear | 833 | 不改结构；只改训练过程（全量、batch 256、cosine、逐 epoch 选轮） | ✅ 续训合同允许 |
+
+- 三题候选都是 `Model.load(父)` 后**继续训练**（保留 Adam 一/二阶矩与 `mean/scale`），不是重新初始化；检查点 `epochs`/`steps` 相对父模型单调增。
+- A 题的 hidden 32→128 拓宽是"显式兼容的权重迁移"（新列/新行按函数保持方式填充并更新 `parameter_count`），但实测无稳定增益，**默认关闭**；B/C 的拓宽路线经实测否决，未启用。
+- B 题的 `D_b` 由**训练标签**推出（组内 RUL=0 行→`max(y)+1`；片段→`y+快照号`）；快照号只用于还原标签尺度，**从不作为模型输入**（题面禁止）。C 题的 `meta.source_subset` 只用于报告分组，从不进入特征。
+
+---
+
+## 3. 第三方组件与许可
+
+镜像基础层为 Python 3.12.4 官方镜像（Debian 12.6），其自带组件的许可证文件随镜像保留。主流程（`/app` 内代码）**只依赖 numpy**。
+
+| 组件 | 镜像内版本 | 许可证 | 用途 | 合规 |
+|---|---|---|---|---|
+| Python | 3.12.4 | PSF License | 运行时 | ✅ |
+| NumPy | 1.26.4 | BSD 3-Clause | 全部数值计算（唯一主流程依赖） | ✅ 保留版权与许可声明 |
+| SciPy | 1.17.1 | BSD 3-Clause | 基础层随附，主流程未调用 | ✅ |
+| scikit-learn | 1.9.1 | BSD 3-Clause | 基础层随附，主流程未调用 | ✅ |
+| swanlab | 0.10.5 | Apache-2.0 | 基础层随附；本版主流程未上传任何记录 | ✅ |
+| 其余基础层包（requests/urllib3/pydantic 等） | 见镜像 | 各自 MIT/BSD/Apache | 基础层依赖，未用于训练或预测 | ✅ 保留原许可文件 |
+
+主流程依赖（numpy）与基础层主要组件均为 BSD/MIT/Apache/PSF 类许可，未主动引入 GPL/AGPL/非商业许可组件；未使用 PyTorch、TensorFlow、HuggingFace 预训练权重或任何外部模型权重。
+
+---
+
+## 4. SDK 与平台接口
+
+| 项 | 值 |
+|---|---|
+| SDK | `contest_harness` **1.0.2**（镜像内 site-packages；`describe` 输出 `sdk_version:"1.0.2"`） |
+| 协议 | `contest.harness.workspace.v2`；prompt_version `industrial-workspace-flexible-v3` |
+| 入口 | `/app/harness.py describe\|train\|predict`；选手模块 `/app/contest_submission.py` |
+| 上传协议 | 1.0.2 内联（`candidate_request`/`state_request` 自带 `files`）；**未注入 1.0.4**，避免宿主未宣告 `chunked-v1` 时抛 `CHUNKED_UPLOAD_UNSUPPORTED` |
+| 平台校验 | 正式评测 30 轮全通（宿主接受 1.0.2 内联），本地仿真 30/30 复现 |
+
+---
+
+## 5. 大模型来源与使用边界
+
+| 项 | 内容 |
+|---|---|
+| 模型 | **Qwen/Qwen3.5-4B**（平台白名单内的基础模型，`rnd.model_name` 由宿主下发） |
+| 调用方式 | 每轮至少 1 次 `rnd.model(messages, max_tokens, temperature=0)`；`finish.model_call_ids` 引用本轮真实回执号 |
+| 输入 | 本轮数据集代号、阶段、父/候选指标摘要、实验元数据、历史轮次摘要（**不含训练数据原文、不含检查点权重、不含密钥**） |
+| 输出 | 一段决策说明（"为什么提交/保留"），写入 `finish.reason` 与 `hypothesis/change_summary`；**不参与前向预测、不写入检查点、不影响 `predict` 输出** |
+| 密钥 | PyTRiO Key 只由平台提交页保管；镜像、源码、文档、训练记录中均不含任何密钥 |
+
+---
+
+## 6. 合规声明（逐条）
+
+| # | 声明 | 事实依据 |
+|---|---|---|
+| 1 | 未使用、未推断隐藏测试标签 | 赛题包内只挂载 `public/` 两个文件；隐藏集不进训练容器；本队未按文件名/样本号反推 |
+| 2 | 未读取桌面原始 CSV | 全部实验脚本只读 `work/a`、`work/b`、`work/c` 与赛题包 `public/`；XJTU-SY / C-MAPSS 原始目录从未被打开 |
+| 3 | 公开验证集不并入梯度训练 | 三个 `strategy.py` 只在 `train_rows`/`x_train` 上求梯度；val 只用于指标、选 epoch 与门槛 |
+| 4 | 父检查点真实续训 | `Model.load(父)` 后继续；保留 Adam 矩与归一化统计量；候选与父字节不同（A 已验收） |
+| 5 | 未重拟合归一化统计量 | A 实测重拟合会掉到 0.5221，因此三题一律沿用父检查点 `mean/scale` |
+| 6 | 不改特征 schema / 任务类型 | 特征只来自 `inputs`，顺序按检查点 `meta.paths`；`task` 以 `rnd.task` 为准 |
+| 7 | 不联网 | 镜像内不发起外部请求；仿真与本机实验全程离线 |
+| 8 | 不写 `/app`、不改 `/previous` | 候选/状态只在 `/workspace`（或 `tempfile` 目录）生成；`Model.save` 目标必须不存在 |
+| 9 | 不把密钥写入镜像/源码/文档 | 见 §5 |
+| 10 | 每轮至少 1 次真实大模型调用 | 快进轮也先调用再 `finish`；30/30 轮 `model_call_ids` 非空且为本轮真实回执 |
+| 11 | 实验记录可复算 | `evidence/report-{a,b,c}.md`、`evidence/sim-app202-summary.md`、`evidence/round-history/{A,B,C}.jsonl` 随源码仓库提交，含逐轮帧摘要、逐 epoch 轨迹与 495 子集缓存汇总 |
+| 12 | 结果口径诚实 | 验证最优轮与固定末轮两个口径都报；val 选型偏差、小类不确定性、短轴承代价均在报告中披露 |
+
+---
+
+## 7. 原创性与引用
+
+| 组件 | 原创性 | 说明 |
+|---|---|---|
+| `contest_submission.py`（接入层、投影 digest、快进、预算、门槛调度） | 独立编写 | 本版新增的父模型保留与快进机制 |
+| `strategies/{a,b,c}_impl.py`、`core.py` | 独立编写 | 三题训练器、目标重定义、配对 bootstrap、IQR/NASA 守卫 |
+| `baselines/` | 基于赛题包官方基线 | 数据适配与 `Model` 语义未改 |
+| 本套文档 | 独立编写 | — |
+
+引用：组委会赛题包与基线代码；UCI #224；XJTU-SY（Wang et al., 2020）；NASA C-MAPSS（Saxena et al., 2008）；平台 PyTRiO / Qwen3.5-4B 服务按其条款使用。
+
+---
+
+## 8. 联系
+
+如有合规疑问，请通过大赛提交平台联系队伍 070228。本声明如与平台最终认定不一致，以平台认定为准。
+
+
+---
+
+# 第三部分 · 系统运行说明
+
+# 系统运行说明（Run Manual）
+
+**队伍 070228（北京印刷学院）｜版本 HAR-02｜日期 2026-11-24**
+
+本文件说明提交镜像在平台侧如何运行、如何构建与校验镜像、如何在本地复现本报告的全部数字，以及已知限制与故障排查。技术结论见 [`technical_report.md`](technical_report.md)，来源与合规见 [`source_declaration.md`](source_declaration.md)。
+
+---
+
+## 1. 提交件清单
+
+| 提交件 | 位置 | 说明 |
+|---|---|---|
+| 系统镜像 | `harness-2.0.2.tar`（391,372,800 B） | `docker save` 未压缩、linux/amd64、单层扁平；tag `harness:1.0.0`；sha256 `56456163261a77242b0a3c1325d0938b8510e6888beacebc034767c2204e8240` |
+| 源码 | 镜像 `/app` + 源码仓库 | 接入层、三题策略、基线、`run.sh` |
+| 文档 | `docs/technical_report.md`、`docs/source_declaration.md`、`docs/run_manual.md` | 本套材料 |
+| 实验结果 | 见技术报告 §6.6 | 逐轮帧、逐 epoch 轨迹、样本外预测缓存 |
+
+镜像内 `/app` 共 12 个文件（138.3 KiB / 141,606 B）：`harness.py`(204 B)、`contest_submission.py`(24,825 B)、`run.sh`(393 B, 权限 0755)、`baselines/`（`__init__`、`data`、`model`、`predict`）、`strategies/`（`__init__`、`a_impl`、`b_impl`、`c_impl`、`core`）。
+
+---
+
+## 2. 平台侧运行
+
+### 2.1 固定入口
+
+```text
+python3 /app/harness.py describe    # 打印一行 JSON，声明协议/任务/模型访问方式
+python3 /app/harness.py train       # 读 /data /previous /state，把候选/状态写 /workspace
+python3 /app/harness.py predict     # stdin 逐行 {"task","inputs"} → stdout 逐行 JSON
+```
+
+`describe` 的实际输出：
+
+```json
+{"protocol":"contest.harness.workspace.v2","model_access":"host_gateway_rpc",
+ "sdk":"contest_harness","sdk_version":"1.0.2",
+ "tasks":["classification","regression"]}
+```
+
+### 2.2 目录与权限（只读 vs 可写）
+
+| 路径 | 权限 | 内容 | 本系统的用法 |
+|---|---|---|---|
+| `/app` | 只读 | 选手代码、SDK、`harness.py` | 只 import，不写 |
+| `/data/train.jsonl`、`/data/validation.jsonl` | 只读 | 当前阶段公开投影 | train 求梯度；validation 只测量/选型 |
+| `/previous` | 只读 | 当前父产物（路径与清单一致） | `Model.load(父)` 续训 |
+| `/state` | 只读 | 上一轮保存的原生状态；首轮可能不存在 | 读投影 digest、轮次、selected |
+| `/model` | 只读，仅预测时挂载 | 被选中的产物 | `predict` 读检查点 |
+| `/workspace` | 可写 | 本轮工作目录 | 候选、状态副本、临时文件都写这里 |
+| `/tmp` | 可写 | 临时文件（可能禁止执行程序） | 仅临时数据 |
+
+不要假设镜像根目录可写；不要在 `/app` 下创建目录或改文件。正式评测 2 vCPU / 4 GiB / 10 GiB 临时盘。
+
+### 2.3 一轮的完整流程
+
+1. **收帧**：从 stdin 读 `start` 帧（dataset_key、round_index、stage_id、`task` 合同、`public_projection`、父产物与 `checkpoint_sha256`、history、`wall_seconds`、`limits`）。
+2. **读数据**：按 `rnd.task["public_projection"]` 打开 train/validation；特征展开顺序严格按父检查点 `meta.paths`。
+3. **复测父模型**：同一 validation 上先算父模型指标（macro-F1 / RMSE / MAE / NASA / IQR），作为本轮对照。
+4. **投影 digest**：`dataset|n_train|n_val|ids|Σy`；若与上一轮相同且上一轮 selected=parent → **快进**：做 1 次 `rnd.model()`，`finish(selected_artifact_id=父产物, configuration.skipped="identical_projection")`，本轮结束（不写 state，沿用上一份）。
+5. **候选训练**：按数据集分发到 `strategies/a_impl.py|b_impl.py|c_impl.py`；每个候选 `Model.load(父)` 后继续；训练预算 `max(20, min(0.40×wall, 180) − 已用时)` 秒；C 题每 25 epoch 检查墙钟，超 `budget×0.85` 早停。
+6. **门槛判定**（同一 validation、与父模型配对比较）：
+   - A：`gain ≥ 0.008`（n_val≥800，否则 0.020）且配对 bootstrap `P(diff>0) ≥ 0.80`；
+   - B：相对改善 `≥5%` 且 `预测IQR/真值IQR ≥ 0.35`；
+   - C：RMSE 改善 `≥1%` 且 NASA 不回归。
+7. **上传**：过门槛 → 候选写 `/workspace` 新目录 → `submit_candidate(candidate_dir, hypothesis, change_summary, configuration, seed, checkpoint_paths, predict_argv)`；宿主校验后返回 `artifact_id` 与公开验证摘要。
+8. **`finish`**：
+
+```python
+rnd.finish(
+    selected_artifact_id=submitted["artifact_id"] 或 rnd.parent.artifact_id,
+    hypothesis="本轮假设",
+    change_summary="相对父模型实际改了什么",
+    reason="根据本轮真实模型回复和平台测量做出的选择",
+    configuration={"epochs": …, "selected": "candidate"|"parent", "digest": "…"},
+    seed=…,
+    history_ids=[item["id"] for item in history],
+    model_call_ids=list(rnd.call_ids),   # 非空，且必须是本轮真实调用
+)
+```
+
+9. **收尾**：只在 `round_complete → round_ack accepted=true` 后退出；stdout 只写协议 JSONL，日志走 stderr。
+
+**硬要求**：每轮至少 1 次真实大模型调用（快进轮也一样）；`finish` 的 `model_call_ids` 必须是本轮 `rnd.model()`/传输层返回的调用号；`selected_artifact_id` 必须是本帧已知的产物（新候选或任一父/历史产物）。
+
+### 2.4 预测
+
+平台按选中产物的 `predict_argv` 启动进程，只挂载该产物到 `/model`，并通过 `CONTEST_ARTIFACT_PATH`/`CONTEST_ARTIFACT_MANIFEST`/`CONTEST_PREDICTION_CONTEXT` 传入上下文。stdin 每行 `{"task","inputs"}`，必须逐行输出并刷新：
+
+```json
+{"outputs":[{"label":"Ethanol","score":0.93}]}      // classification：score∈[0,1]，label 唯一，最高分唯一
+{"outputs":{"value":123.4}}                          // regression：有限非负数
+```
+
+缺行、等 EOF、超时或形状不符会导致整次测量失败（平台不补值）。回归端 `max(0, logit·target_scale + target_mean)` 由官方 `Model.predict` 提供，B 题的目标重定义完全落在 `target_scale/target_mean` 上，故 `predict.py` 无需修改。
+
+---
+
+## 3. 镜像构建与校验
+
+### 3.1 构建（不注入 SDK，只替换 `/app`）
+
+```powershell
+# 1) 准备打包用 /app：源码快照 + 去 __pycache__/.pyc + 最小 run.sh（LF、0755）
+#    final-app/ = app-final/ 去掉 SNAPSHOT.json、去掉 __pycache__，加 run.sh
+# 2) 以官方 1.0.0 镜像为底，只替换 /app，单层重打包并自校验
+& $py -X utf8 repack_image.py --image <原始 harness-1.0.0 镜像 tar> --app-dir final-app --tags harness:1.0.0 --output harness-2.0.2.tar
+```
+
+> 本次实际使用的底镜像是 `harness-1.0.0-artfix.tar`（373.62 MiB，原层 `layer-759b466965a6`）；重打包后层为 `layer-84c872ea02fc`（373.23 MiB），保留原层载荷 13,259 个成员并逐条比对。
+
+`run.sh`（平台实际执行 `python3 /app/harness.py …`，该脚本只兼容原镜像 `Entrypoint`）：
+
+```sh
+#!/bin/sh
+if [ "$#" -gt 0 ]; then exec "$@"; fi
+exec sleep infinity
+```
+
+### 3.2 校验
+
+```powershell
+# 结构校验 + 安全解包 + 层内 /app 卫生检查 + describe 自检
+& $py -X utf8 verify_image.py --image harness-2.0.2.tar --dest image-rootfs-v202 --report runs\verify_image_v202.md
+# 只校验结构、不解包
+& $py -X utf8 verify_image.py --image harness-2.0.2.tar --no-extract
+```
+
+校验项与实测结论：
+
+| 检查项 | 结果 |
+|---|---|
+| manifest / repositories / config 交叉一致；单层扁平；tag `harness:1.0.0` | ✅ |
+| 层 sha256 == `config.rootfs.diff_ids[0]`（`84c872ea02fc…`） | ✅ |
+| `history` 条数与非 empty_layer 层数一致（6 条 / 1 非空） | ✅ |
+| `/app` 12 文件与源目录逐条一致；`run.sh` 层内模式 0o755；无 `__pycache__`/`.pyc`/`contest_harness` 副本 | ✅ |
+| 成员路径无盘符、无绝对路径、无 `..`；未替换载荷逐条（大小+sha256）一致 | ✅ |
+| 解包后用本机 python 在 rootfs 上跑 `describe` | ✅ 返回合法 JSON（`sdk_version:"1.0.2"`） |
+| Windows 解包无法创建 822 个符号链接 | ⚠️ 本机限制，不影响 tar 本体 |
+
+---
+
+## 4. 本地复现
+
+> `$py` 为本机 Python 3.12 解释器路径（示例：`C:\Users\Administrator\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe`），按环境替换；线程固定为 2。
+
+### 4.1 三题离线复现（只用赛题包 public 数据）
+
+> 以下路径相对开发工作树（`work/a|b|c`）。提交仓库中以 `evidence/` 存放冻结记录（见技术报告 §6.6），源码按 `contest_submission.py` + `strategies/` 复现同口径数字。
+
+```powershell
+$env:BASELINE_CPU_THREADS="2"; $env:OMP_NUM_THREADS="2"
+
+# A：复现父模型 0.714030 + 漂移诊断 + 31 配置网格 + 样本外遴选 + 接口自测
+& $py work\a\step1_repro.py
+& $py work\a\step3_grid.py
+& $py work\a\step5_recipe.py
+& $py work\a\verify_strategy.py
+& $py work\a\verify_xy_interface.py          # 期望输出「判定：PASS」，Δ=0.000e+00
+
+# B：复现 681.159833 + trainer 与 Model.fit 等价 + LOBO 网格 + 交付候选体检
+& $py work\b\step1_repro.py
+& $py work\b\step3_verify.py
+& $py work\b\step12_final.py
+& $py work\b\step15_validate2.py
+
+# C：复现 52.869/38.900 + 误差解剖 + 推荐配置/LOBO + 接口与序列化自测
+cd work\c
+& $py probe.py
+& $py errbins.py
+& $py run.py final_grid
+& $py run.py lobo
+& $py test_xy.py                             # 全量 / 有序截断陷阱 / stage 切换三用例
+& $py test_serialize.py
+```
+
+对照期望值（容差 1%）：
+
+| 数据集 | 父检查点（public validation） | 本版候选 | 备注 |
+|---|---|---|---|
+| A | macro-F1 0.714030 / acc 0.878617 | **0.755890**（+0.0419） | `verify_strategy.py` 与 `verify_xy_interface.py` 应给同一值 |
+| B | RMSE 681.159833 / MAE 563.105841 | **450.316**（−33.9%） | 离线候选口径 441.00；LOBO 947→654 |
+| C | RMSE 52.868573 / MAE 38.899830 | **50.258**（−4.94%） | 固定末轮 50.435；NASA 5.823e9→2.709e9 |
+
+### 4.2 平台协议仿真（开发期工具，不随镜像提交）
+
+真实子进程 + `subst` 挂载 + 完整 `contest.harness.workspace.v2` 帧，30 轮（3 数据集 × 10）：
+
+```powershell
+cd work\harness
+$sdk102 = "<SDK 1.0.2 目录>"
+
+# 主证据：真实 /app × SDK 1.0.2 × 10 轮 × 3 数据集（约 4–5 min）
+& $py -X utf8 platform_sim.py --app app-202 --sdk $sdk102 --datasets A B C --rounds 10 --runs-root runs-app202 --no-sdk-selftest
+
+# 空壳提交 + SDK 1.0.4（验证分块上传路径）
+& $py -X utf8 platform_sim.py --datasets A B C --rounds 10
+
+# 只打印一帧 start / 缩短验证集调试
+& $py -X utf8 platform_sim.py --show-frame A
+& $py -X utf8 platform_sim.py --datasets C --rounds 1 --val-limit 2000
+```
+
+期望：退出码 0；`runs-app202/summary.md` 中 A 0.755119 / B 450.316 / C 50.258 选中，第 2–10 轮 parent，30/30 无失败，父检查点复现偏差 0.00%。
+
+### 4.3 单轮手动跑（不依赖仿真器）
+
+把赛题包 `public/` 挂成 `/data`、父产物挂成 `/previous`、空目录挂成 `/workspace`，然后：
+
+```bash
+python3 /app/harness.py train < start.frame.json
+python3 /app/harness.py predict < samples.jsonl
+```
+
+---
+
+## 5. 已知限制
+
+| # | 限制 | 影响 | 处置 |
+|---|---|---|---|
+| 1 | 仿真器只换 `stage_id`、不换公开投影 | 未在仿真里验证"换阶段一次性适配" | 用技术报告 §6.3 的三个模拟 stage 单独验证（首轮 −3.1%~−5.6%） |
+| 2 | 仿真器模型调用是离线 stub | 未验证真实网关延迟与返回质量 | 协议层（每轮≥1 次真实调用、`model_call_ids` 非空）已验证；真实质量待试运行 |
+| 3 | RSS/耗时是本机相对参考 | 不能直接当正式环境数字 | 正式 2 vCPU 预算下 C 端到端 50.3–60.6 s、峰值 229 MiB，余量充足 |
+| 4 | Windows 无 chroot，只读权限未强制 | 本地写 `/app` 会"成功"，不能验证只读边界 | 代码层不写 `/app`；正式环境由平台强制 |
+| 5 | 符号链接在 Windows 解包失败（822 个） | 仅影响本机解包，不影响 tar | 不影响提交；`/app` 与 site-packages 已解出并 `describe` 通过 |
+| 6 | `subst` 可能残留盘符 | 下次运行冲突 | `subst` 查看后 `subst X: /D`；仿真器正常结束会自行释放 |
+| 7 | B 题的 `c=1000` 是外部先验 | 隐藏集若以长寿命为主会欠预测 | 900–1,300 为平顶区（误差 ≤7%）；必要时上调 1,300–1,500（单行常量） |
+| 8 | A 的 margin 0.008 按 n_val≈1,244 定 | 小验证集会偏松 | 代码已按 n_val<800 自动抬到 0.020 |
+
+---
+
+## 6. 故障排查
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| `PARENT_DIGEST_MISMATCH` | `/previous` 字节被改，或绕开 `rnd.parent.path()` 直接读文件 | 只用 SDK 接口读父产物；不改 `/previous` |
+| `ROUND_ACK_MISSING` | `finish` 后在 `round_ack accepted=true` 之前继续发帧或提前退出 | `finish` 后等待 ack，然后立即退出进程 |
+| `MODEL_CALL_REQUIRED` | `model_call_ids` 为空或引用了非本轮调用 | 每轮先 `rnd.model()`，`finish` 用 `list(rnd.call_ids)` |
+| `CHUNKED_UPLOAD_UNSUPPORTED` | 给镜像注入了 SDK 1.0.4，而宿主未宣告 `chunked-v1` | 保持镜像内 1.0.2；不要升级 SDK |
+| `Model.save` 报目标已存在 | `/workspace` 未清空或复用路径 | 每轮用新的 `tempfile.mkdtemp()` 子目录 |
+| predict 整次测量失败 | 少写一行、未 flush、等 EOF、分数越界或最高分不唯一 | 逐行输出并 flush；分类分数∈[0,1]、最高分唯一；回归非负有限 |
+| `RPC_OUTCOME_UNKNOWN` | RPC 被信号/超时中断，宿主是否处理未知 | 不要捕获后继续调用；本轮会话不可复用，直接失败退出 |
+| describe 未通过 | `/app/harness.py` 缺失、选手模块 import 失败、`tasks` 声明不符 | 检查 12 个文件齐全、`PYTHONPATH` 含 SDK、无语法错误 |
+
+---
+
+## 7. 复现一键清单
+
+```powershell
+# 0) 环境
+$env:BASELINE_CPU_THREADS="2"; $env:OMP_NUM_THREADS="2"
+$py="…\python.exe"
+
+# 1) 三题父模型复现（应 0.00% 偏差）
+& $py work\a\step1_repro.py
+& $py work\b\step1_repro.py
+& $py work\c\probe.py
+
+# 2) 三题接口自测（应 PASS / 三用例全过）
+& $py work\a\verify_xy_interface.py
+& $py work\b\step15_validate2.py
+& $py work\c\test_xy.py
+
+# 3) 平台协议 30 轮仿真（$sdk102 见 §4.2，先 cd 到 work\harness）
+cd work\harness; & $py -X utf8 platform_sim.py --app app-202 --sdk $sdk102 --datasets A B C --rounds 10 --runs-root runs-app202 --no-sdk-selftest
+
+# 4) 镜像校验
+& $py -X utf8 verify_image.py --image harness-2.0.2.tar --dest image-rootfs-v202 --report runs\verify_image_v202.md
+```
+
+
+---
+
