@@ -1,4 +1,4 @@
-"""平台固定入口：/app/harness.py。平台会追加 describe / train / predict。"""
+"""Copy this file to /app/harness.py. The platform appends describe, train or predict."""
 import sys
 
 from contest_harness.cli import main
