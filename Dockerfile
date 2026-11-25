@@ -1,4 +1,4 @@
-# HAR-02 reference image definition.
+﻿# HAR-02 reference image definition.
 #
 # The submitted image (harness-2.0.2.tar) was produced as a flat, single-layer
 # docker archive whose /app tree is byte-identical to this repository.  It is
@@ -39,7 +39,7 @@ RUN pip install --no-cache-dir /tmp/sdk && rm -rf /tmp/sdk
 
 COPY baselines/ /app/baselines/
 COPY strategies/ /app/strategies/
-COPY contest_submission.py harness.py run.sh /app/
+COPY contest_submission.py harness.py stage_policy.py run.sh /app/
 COPY docs/ /app/docs/
 
 RUN chmod 0755 /app/run.sh

@@ -31,6 +31,7 @@ if str(HERE) not in sys.path:
 from baselines import data as D                                  # noqa: E402
 from baselines.model import Model                                # noqa: E402
 from strategies import core, is_better, sample_weights, train_and_select  # noqa: E402
+import stage_policy  # noqa: E402  阶段感知门槛（新阶段首轮放宽，同阶段严格）
 from strategies import widen_hidden, _apply_target_transform               # noqa: E402
 
 PREDICT_ARGV = ["python3", "/app/harness.py", "predict"]
@@ -128,6 +129,20 @@ def _history_digest(history):
 # --------------------------------------------------------------------------- #
 # extra candidate requested by the model advisor
 # --------------------------------------------------------------------------- #
+def _stage_context(history, stage_id):
+    """从历史 finish 记录推出 (是否新阶段, 本阶段第几轮)。"""
+    prev_stage, same = None, 0
+    for record in reversed(history or []):
+        configuration = record.get("configuration") or {}
+        if configuration.get("stage_id") is None:
+            continue
+        prev_stage = configuration.get("stage_id")
+        if prev_stage != stage_id:
+            break
+        same += 1
+    return (prev_stage != stage_id), same + 1
+
+
 def _train_extra(rnd, parent_path, x_train, y_train, x_val, y_val, task, classes,
                  metric, advice, best, direction, parent_score, seed, log):
     epochs = max(1, min(600, int(advice.get("epochs", 0) or 0)))
@@ -204,9 +219,32 @@ def train(rnd):
          % (dataset, stage_id, round_index, len(paths), train_info["rows"],
             val_info["rows"], train_budget, digest[:12]))
 
+    # --- 阶段感知门槛：新阶段第一轮放宽（让阶段切换后的适配能被采纳），
+    #     同阶段后续轮恢复严格，验证投影过小时不放宽。失败即退回固定门槛。 ---
+    stage_changed, round_in_stage = _stage_context(history, stage_id)
+    policy_margin = None
+    try:
+        if task == "classification":
+            parent_now = stage_policy.macro_f1_observed(
+                y_val, np.argmax(parent.predict(x_val), axis=1))
+        else:
+            parent_now = core.score_value(
+                core.evaluate(parent, x_val, y_val, task, len(classes)), metric)
+        policy_margin = stage_policy.margin_for(
+            parent_now, None, metric, direction, stage_changed, round_in_stage,
+            int(len(y_val)), dataset_key=dataset,
+            prev_parent_metric=_num(previous.get("parent_value")))
+        _log("阶段策略：stage_changed=%s round_in_stage=%d n_val=%d margin=%.4f"
+             % (stage_changed, round_in_stage, len(y_val), policy_margin))
+    except Exception as error:
+        _log("阶段策略不可用，沿用固定门槛：%r" % (error,))
+
     # Same projection as the round that already concluded "no improvement":
-    # re-training it again would only burn the round budget.
-    if previous.get("digest") == digest and previous.get("selected") == "parent":
+    # re-training it again would only burn the round budget.  A new stage is
+    # never fast-forwarded -- its projection may look identical while the stage
+    # semantics changed.
+    if (not stage_changed and previous.get("digest") == digest
+            and previous.get("selected") == "parent"):
         _log("投影与上一轮完全一致且上一轮已判定保留父模型，本轮直接保留父模型")
         receipt = rnd.model(
             [{"role": "user", "content": (
@@ -240,7 +278,8 @@ def train(rnd):
         result = train_and_select(Model, checkpoint_path, x_train, y_train, x_val,
                                   y_val, task, classes, metric, train_budget,
                                   round_index, dataset, log=_log,
-                                  ids_train=ids_train, ids_val=ids_val)
+                                  ids_train=ids_train, ids_val=ids_val,
+                                  margin=policy_margin)
     except Exception as error:  # never lose the round: keep the parent
         _log("训练/选择异常，保留父模型：%r" % (error,))
         result = {"selected": "parent", "metrics": {}, "parent_metrics": {},
@@ -256,33 +295,28 @@ def train(rnd):
     best_score = core.score_value(best_metrics, metric)
     experiments = result.get("experiments") or []
 
+    # 精简 prompt：宿主已经会在前面拼官方提示，这里只带决策必需的标量，
+    # 把 Token 花在改进上而不是重复元数据上。
     summary = {
-        "dataset_key": dataset, "stage_id": stage_id, "round_index": round_index,
-        "task": task, "metric": metric, "direction": direction,
-        "train_rows": train_info["rows"], "validation_rows": val_info["rows"],
-        "history_rounds": len(history), "history": _history_digest(history),
-        "parent_metrics": {k: round(v, 6) for k, v in parent_metrics.items()
-                           if isinstance(v, float)},
-        "experiments": [{k: v for k, v in record.items() if k != "metrics"}
-                        for record in experiments],
-        "candidate_metrics": {k: round(v, 6) for k, v in best_metrics.items()
-                              if isinstance(v, float)},
-        "provisional": result["selected"],
-        "elapsed_s": result.get("elapsed", round(time.time() - started, 2)),
+        "ds": dataset, "stage": stage_id, "round": round_index, "metric": metric,
+        "rows": [train_info["rows"], val_info["rows"]],
+        "parent": _num(parent_metrics.get(metric)),
+        "trials": [[record.get("name"), _num(record.get("score"))]
+                   for record in experiments[:4]],
+        "best": _num(best_metrics.get(metric) if best_metrics else None),
+        "kept_parent": result["selected"] != "candidate",
+        "prev": _history_digest(history)[-2:],
     }
 
     receipt = rnd.model(
         [{"role": "user", "content": (
-            "你是工业模型自进化的策略评审。下面是本轮在当前阶段公开数据上的真实实验结果（JSON）。\n"
-            "%s\n"
-            "约束：只能从当前父检查点续训；验证集不得进入梯度训练；单轮时间预算 %.0fs。\n"
-            "请判断是否采纳当前最优候选，或给出一个更值得尝试的续训配置。只输出一个 JSON：\n"
-            "{\"decision\":\"keep_best|try_again\",\"epochs\":整数1-600,\"learning_rate\":0.0001-0.05,"
-            "\"noise\":0-2,\"shrink\":0-1或null,\"reason\":\"一句话中文理由\"}"
-            % (json.dumps(summary, ensure_ascii=False, sort_keys=True, default=str),
-               train_budget)
+            "本轮公开实验（JSON）：%s\n"
+            "判断采纳最优候选还是保留父模型，只回一个 JSON："
+            "{\"decision\":\"keep_best|try_again\",\"epochs\":1-600,\"learning_rate\":0.0001-0.05,"
+            "\"reason\":\"一句话\"}"
+            % json.dumps(summary, ensure_ascii=False, sort_keys=True, default=str)
         )}],
-        max_tokens=min(600, rnd.max_output_tokens),
+        max_tokens=min(320, rnd.max_output_tokens),
         temperature=0,
     )
     advice = _receipt_json(receipt.text)
@@ -319,6 +353,9 @@ def train(rnd):
         "train_rows": train_info["rows"], "validation_rows": val_info["rows"],
         "experiments": len(experiments),
         "elapsed_s": round(time.time() - started, 2),
+        "policy_margin": policy_margin,
+        "stage_changed": stage_changed,
+        "round_in_stage": round_in_stage,
     }
 
     if best is None:
@@ -377,8 +414,10 @@ def train(rnd):
         (state / STATE_NOTE).write_text(json.dumps(
             {"round": round_index, "stage": stage_id, "dataset": dataset,
              "selected": "candidate", "digest": digest,
-             "metrics": summary["candidate_metrics"],
-             "parent_metrics": summary["parent_metrics"],
+             "metrics": {k: round(v, 6) for k, v in best_metrics.items()
+                         if isinstance(v, float)},
+             "parent_metrics": {k: round(v, 6) for k, v in parent_metrics.items()
+                                if isinstance(v, float)},
              "experiments": len(experiments),
              "parent_value": _num(parent_metrics.get(metric)),
              "plan": configuration["plan"]}, ensure_ascii=False, sort_keys=True),

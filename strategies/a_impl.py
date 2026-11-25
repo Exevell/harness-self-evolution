@@ -384,10 +384,13 @@ def train_and_select(model_cls, parent_ckpt_path, train_rows, val_rows, task, cl
     fractions = (0.5, 1.0) if cheap else CHECKPOINT_FRACTIONS
     lr = float(np.clip(parent_meta.get("learning_rate") or DEFAULT_LR, 1e-3, 5e-3))
 
-    specs = [("fit-now-plain", {"noise": 0.0, "weights": False, "drop": 0.0})]
+    # 去掉恒输的 plain 候选（只省算力，不改变最优候选）
+    specs = []
     if task == "classification":
         specs += [("regularized-lite", {"noise": 0.5, "weights": True, "drop": 0.1}),
                   ("regularized-strong", {"noise": 0.8, "weights": True, "drop": 0.1})]
+    else:
+        specs = [("fit-now-plain", {"noise": 0.0, "weights": False, "drop": 0.0})]
     do_widen = (len(train["y"]) >= 1500) if enable_widen is None else bool(enable_widen)
     if do_widen and task == "classification":
         specs.append(("widened-128", {"noise": 0.5, "weights": True, "drop": 0.1, "widen": 128}))
@@ -617,10 +620,13 @@ def train_and_select_xy(model_cls, parent_path, x_train, y_train, x_val, y_val,
     fractions = (0.5, 1.0) if cheap else CHECKPOINT_FRACTIONS
     lr = float(np.clip(parent_meta.get("learning_rate") or DEFAULT_LR, 1e-3, 5e-3))
 
-    specs = [("fit-now-plain", {"noise": 0.0, "weights": False, "drop": 0.0})]
+    # 去掉恒输的 plain 候选（只省算力，最优候选不变）
+    specs = []
     if task == "classification":
         specs += [("regularized-lite", {"noise": 0.5, "weights": True, "drop": 0.1}),
                   ("regularized-strong", {"noise": 0.8, "weights": True, "drop": 0.1})]
+    else:
+        specs = [("fit-now-plain", {"noise": 0.0, "weights": False, "drop": 0.0})]
     do_widen = (len(y_train) >= 1500) if enable_widen is None else bool(enable_widen)
     if do_widen and task == "classification":
         specs.append(("widened-128", {"noise": 0.5, "weights": True, "drop": 0.1, "widen": 128}))
