@@ -234,8 +234,16 @@ def train(rnd):
             parent_now, None, metric, direction, stage_changed, round_in_stage,
             int(len(y_val)), dataset_key=dataset,
             prev_parent_metric=_num(previous.get("parent_value")))
-        _log("阶段策略：stage_changed=%s round_in_stage=%d n_val=%d margin=%.4f"
-             % (stage_changed, round_in_stage, len(y_val), policy_margin))
+        # B 题在隐藏集上对"放宽门槛"极其敏感（试运行实测：放宽到 1% 后，
+        # 公开集仅好 1% 的候选在隐藏集上 RMSE 从 379 恶化到 707）。
+        # 只对 A/C 启用阶段放宽，B 永远使用策略自己的 5% 严格门槛。
+        enabled = os.environ.get("CONTEST_STAGE_POLICY", "A,C").split(",")
+        if dataset not in [item.strip() for item in enabled]:
+            policy_margin = None
+            _log("阶段策略：%s 不在启用列表，沿用策略固定门槛" % dataset)
+        _log("阶段策略：stage_changed=%s round_in_stage=%d n_val=%d margin=%s"
+             % (stage_changed, round_in_stage, len(y_val),
+                "策略自定" if policy_margin is None else "%.4f" % policy_margin))
     except Exception as error:
         _log("阶段策略不可用，沿用固定门槛：%r" % (error,))
 
