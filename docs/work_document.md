@@ -7,7 +7,7 @@
 
 | 材料 | 位置 / 链接 | 说明 |
 |---|---|---|
-| **系统镜像** | `harness-3.0.2.tar`（linux/amd64，单层扁平）<br>大小 **391,393,280 B**（373.24 MiB）<br>sha256 **`90767d8d731669583e9274cdeb285e1f28f2e2dfe503bb8a3af19c0acdf2994f`**<br>tag `harness:1.0.0`；内置 SDK `contest_harness 1.0.2` | 已在平台"镜像归档"上传并通过校验。入口 `/app/run.sh` → `python3 /app/harness.py describe\|train\|predict` |
+| **系统镜像** | `harness-4.1.0.tar`（linux/amd64，单层扁平）<br>大小 **391,475,200 B**（373.24 MiB）<br>sha256 **`d6f0f2848b3be214b13af5dde550e82e99fde8443e86fe41dba1a5bc580fd336`**<br>tag `harness:1.0.0`；内置 SDK `contest_harness 1.0.5` | 已在平台"镜像归档"上传并通过校验；同时提供网盘下载（企业赛要求）：[网盘链接](https://pan.baidu.com/s/1Mlo8kWMWsLCesZEYvsxLhw?pwd=1y4p) 提取码 `1y4p`。入口 `/app/run.sh` → `python3 /app/harness.py describe\|train\|predict` |
 | **源码仓库** | <https://github.com/Exevell/harness-self-evolution>（main 分支） | 含 `contest_submission.py`、`strategies/`、`baselines/`、`docs/`、`evidence/`（三题实验报告 + 30 轮协议仿真记录）。镜像内 `/app` 与仓库文件**逐字节一致**，sha256 见文末附录 |
 | **云端实验记录（SwanLab）** | <https://swanlab.cn/@070228Ggx/harness-self-evolution/runs/wfq2u9mz> | 含三数据集逐轮候选、指标、决策理由、隐藏测试指标与资源计量；**其中至少 3 次完整的"读历史—做实验—依据结果决策"记录**：<br>① 第 1 轮：父模型 0.714030 → 候选 0.755119，采纳；<br>② 第 3 轮：stage-02 漂移后父模型 0.739598 → 候选 0.946537，采纳；<br>③ 第 7 轮：stage-05 父模型掉到 0.828515 → 候选 0.985285，单轮恢复并采纳 |
 | **演示视频（≤5 分钟）** | [网盘链接](https://pan.baidu.com/s/1lHphExR9QXfasV8YRRr6Yw)（提取码 `sxsi`） | 演示 `describe → train → predict` 全流程：第 1 轮父模型 0.714030→候选 0.755119 被采纳；第 2 轮候选未超门槛，保留父模型；以及平台十轮逐轮记录与 SwanLab 实验记录 |
@@ -299,7 +299,7 @@ A 用 31 个配置（batch1 训练 → batch2 评测）做配方网格；因为"
 
 ### 6.4 平台协议仿真：30 轮端到端
 
-用真实子进程 + 真实文件挂载 + 完整 `contest.harness.workspace.v2` 帧（SDK 1.0.2 内联上传路径），跑 3 数据集 × 10 轮：
+用真实子进程 + 真实文件挂载 + 完整 `contest.harness.workspace.v2` 帧（SDK 1.0.5 内联上传路径），跑 3 数据集 × 10 轮：
 
 | 数据集 | 第 1 轮候选（选中） | 第 2–10 轮 | 最长单轮 train | 峰值 RSS | 候选字节 |
 |---|---|---|---|---|---|
@@ -357,7 +357,7 @@ C 的单 epoch 0.094 s，600 epoch ≈ 56 s，端到端 50.3–60.6 s（占预�
 | `/app` | 12 个文件 / **138.3 KiB（141,606 B）**：`harness.py`(204 B)、`contest_submission.py`(24,825 B)、`run.sh`(393 B, 0755)、`baselines/`(4)、`strategies/`(5) |
 | 卫生 | 无 `__pycache__`、无 `.pyc`、无 SDK 副本；`run.sh` 为 LF |
 | 运行时 | Python 3.12.4 + numpy 1.26.4（镜像内另有 scipy 1.17.1 / scikit-learn 1.9.1 / swanlab 0.10.5，主流程未依赖） |
-| SDK | 镜像内 `contest_harness 1.0.2`；`describe` 输出 `sdk_version:"1.0.2"` |
+| SDK | 镜像内 `contest_harness 1.0.5`；`describe` 输出 `sdk_version:"1.0.5"` |
 
 镜像自检：结构硬校验失败 0、警告 3（Windows 解包无法建 822 个符号链接，属本机限制）、通过 22；`describe` 在 `subst` 挂载 + bridge 下返回合法 JSON。
 
@@ -366,7 +366,7 @@ C 的单 epoch 0.094 s，600 epoch ≈ 56 s，端到端 50.3–60.6 s（占预�
 | 能力 | 说明 |
 |---|---|
 | 真实容器行为 | 真实子进程 `python <盘符>:\app\harness.py train`；`/app`、`/data`、`/previous`、`/state`、`/model`、`/workspace` 经 `subst` 真实落盘 |
-| 完整协议 | 两代上传协议（1.0.2 内联 / 1.0.4 分块）；候选测量由宿主用 `predict_argv` 真跑完整 validation |
+| 完整协议 | 分块上传（`chunked-v1`）；候选测量由宿主用 `predict_argv` 真跑完整 validation |
 | 逐轮证据 | 每轮帧、指标、`finish` 记录、stderr 全落盘；父绑定/摘要/引用校验与真实宿主同规则 |
 | 边界 | 只换 `stage_id` 不换投影；模型调用是离线 stub；RSS/时间是本机相对参考；只读权限未强制 |
 
@@ -377,6 +377,53 @@ C 的单 epoch 0.094 s，600 epoch ≈ 56 s，端到端 50.3–60.6 s（占预�
 - **不会写到不存在的目录**：每轮先建 `/workspace/<round>/` 新目录；`Model.save` 前断言目标不存在；状态先复制再改（`rnd.state_workspace`）。
 - **失败即回滚**：候选上传/测量异常一律退回 `selected=parent`，不让"半成品"占住产物位；C 题分块早停返回已完成轮次而不是报错。
 - **可移植**：路径一律走 `rnd.parent.path()`/`public_projection`，不写死 `/previous/checkpoint.npz`；不依赖 `/app` 可写。
+
+---
+
+### 7.5 资源优化三补丁（HAR-04.3，30 轮实测 −74%）
+
+| 补丁 | 做法 | 效果（30 轮，4 线程） |
+|---|---|---|
+| P1 字节指纹快进 | 空闲轮用 `/data/*.jsonl` 的字节 sha256 判定投影未变，**不解析 JSON、不建矩阵、不评父模型** | 空闲轮 C 8.68 s → **0.17 s**；27 个空闲轮合计 95.8 s → 4.1 s |
+| P2 flatten 记忆化 | 特征路径与禁用键判定按结构位置缓存（上限 8192），与 `baselines.data.flatten` 逐条等价（426 例零差异） | 全量轮 38.6 s → 27.7 s（−28%）；测量阶段 −31%；predict 单行 −28%~−40% |
+| P3 Token 精简 | 快路径 prompt 135→77 字符；summary 去重复元数据；completion 上限 200→128 | 自有 prompt −37%；时长 ±0 |
+
+合计：**30 轮训练 122.2 s → 31.6 s（−74%）**，三题指标逐轮完全不变（A 0.755119 / B 450.316 / C 50.867）；
+相对 HAR-02（608 s）下降约 **95%**。双盲对照（同投影只搜一次，指标零差异）见仓库 `evidence/validation-fastpath.md`。
+
+---
+
+### 6.9 企业赛阶段的两条否决记录（"评估口径必须对齐部署口径"）
+
+**B 题：等价位续训初始化 + 400 epoch + 3 seed 权重平均（候选 −7.1%）→ 否决**
+
+候选在 seed=42 下把公开验证集 RMSE 从 441.00 降到 363.40，看起来是本轮最大机会。但线上管线传入的
+`seed = 当轮轮次`（1…10），实测同一份候选在 seed=1 下只有 402–423，且 seed=1 时预测 IQR 比 0.3499
+会触发 IQR 守卫直接退回父模型。进一步用 resume-LOBO 做跨种子复核：
+
+| seed 基 | 现配方（均值·p90·最差轴承） | 候选 | 增益 |
+|---|---|---|---|
+| 1 | 756.0·1197.6·1354.6 | 731.3·1122.8·1273.5 | +3.3% |
+| 2 | 732.5·1205.5·1360.8 | 742.2·1234.8·1397.1 | **−1.3%** |
+| 42 | 706.6·1112.1·1255.1 | 656.6·927.3·1022.5 | +7.1% |
+| 3 / 4 / 5 | — | — | +12.2% / **−1.6%** / +5.8% |
+
+6 个种子基均值 +4.2%、其中 2/6 反向；改用"不依赖传入 seed 的固定 6-seed 变体"后只有 **+1.3%**。
+**结论：−7.1% 是 seed=42 的抽签结果，改进不成立，不采用**（回退开关 `LEGACY_DEPLOYED=True` 已验证
+可逐位复现现网 441.0018）。
+
+**C 题：多 seed 权重平均（降方差）→ 否决**
+
+| 口径 | seed42 | seed143 | seed244 | 3-seed 平均 |
+|---|---|---|---|---|
+| 发动机切分 RMSE | 55.87 | 53.83 | 53.78 | **53.79** |
+| 公开验证集 RMSE | 53.90 | 50.80 | 50.90 | 51.13 |
+
+平均只在"最差种子"上占优（发动机切分 55.87→53.79），对最好种子无增益（公开 50.80→51.13 反而略差）。
+**结论：多 seed 平均只降方差、不提均值，收益落在噪声内，不采用。**
+
+这两条与 §6.7（C 目标截断）一起说明：**评估口径必须与部署口径一致**（种子、轮次、投影、目标形态），
+否则"公开集上的漂亮数字"在隐藏集上会反向。这也是本版把"同一投影只搜一次"做成可回退开关的原因。
 
 ---
 
@@ -522,6 +569,41 @@ C 的隐藏 RMSE 56.13→**55.72**、NASA 1.32e11→**1.07e11**，Token 51,843�
 
 ---
 
+### 6.7 C 题：目标截断的对照实验（判断隐藏集形态）
+
+CMAPSS 常用"训练目标截断到 130"提升测试 RMSE。我们按**发动机切分 + 序列截断**构造三种隐藏代理
+（full 全序列 / trunc 截断取最后 30 观测 / mixed），只改训练目标，其余不变：
+
+| 训练目标 | full | trunc | mixed |
+|---|---|---|---|
+| 不截断（当前做法） | **55.91** | 44.18 | 37.28 |
+| 上限 200 | 57.99 | 38.68 | 34.26 |
+| 上限 150 | 65.12 | 30.41 | 28.56 |
+| 上限 130 | 71.00 | **25.68** | **25.22** |
+
+平台实测 C 隐藏 RMSE 56.13 / 55.72，与本地 `full` 的 55.91 几乎重合，而与 `trunc` 的 44.18 相差很远
+→ **隐藏测试流是完整序列形态**，截断会让 RMSE 变差约 27%。因此**不采用截断**（详见 `work/C_CAPPING_EXPERIMENT.md`）。
+这条对照同时说明：C 的公开验证集对隐藏集有代表性，而 B 的公开验证集完全不可代表（单根轴承 90% 样本），
+必须逐数据集判断，不能一刀切。
+
+---
+
+### 6.8 运行时长优化（同一投影只搜一次）的对照验证
+
+为避免"省时长换来漏采纳"，在**真实阶段漂移**的数据流上做了双盲对照（同一代码、只切开关）：
+
+| 数据集 | 阶段投影变化 | 两臂逐轮指标 | 跳过轮耗时 vs 重训轮耗时 |
+|---|---|---|---|
+| A | batch1 固定，逐阶段并入 batch2 已"标注"样本（445→1531 行） | **完全一致** | 0.48 s vs 1.57 s |
+| B | 逐阶段并入验证轴承，验证集轮换 | **完全一致** | 1.05 s vs 5.43 s |
+| C | 按 FD001–FD004 逐阶段扩展（14k→113k 行） | **完全一致** | 7.3 s vs 19.6 s |
+
+60 轮对照指标零差异，重复投影上的训练时长下降 56%–70%。C 题后 6 轮投影相同时，对照臂每轮重训
+**也没有一次**采纳到更优候选（父模型恒定 60.762），证明重复搜索无信息增益。
+详见 `work/VALIDATION_FASTPATH.md`。
+
+---
+
 ## 9. 局限与后续
 
 1. **A 的小类上限**：Acetaldehyde 在 batch1 上不可分，macro-F1 对它是等权重的，这一项上限约 +0.167；Toluene 只有 5 例时任何结论都不精确。
@@ -555,7 +637,7 @@ C 的隐藏 RMSE 56.13→**55.72**、NASA 1.32e11→**1.07e11**，Token 51,843�
 | 大小 | **391,372,800 B**（373.24 MiB） |
 | sha256 | `56456163261a77242b0a3c1325d0938b8510e6888beacebc034767c2204e8240` |
 | Tag | `harness:1.0.0` |
-| 内置 SDK | `contest_harness` 1.0.2 |
+| 内置 SDK | `contest_harness` 1.0.5 |
 | 实验记录 | `evidence/report-{a,b,c}.md`、`evidence/sim-app202-summary.md`、`evidence/round-history/{A,B,C}.jsonl` |
 
 ---
@@ -686,11 +768,11 @@ C 的隐藏 RMSE 56.13→**55.72**、NASA 1.32e11→**1.07e11**，Token 51,843�
 
 | 项 | 值 |
 |---|---|
-| SDK | `contest_harness` **1.0.2**（镜像内 site-packages；`describe` 输出 `sdk_version:"1.0.2"`） |
+| SDK | `contest_harness` **1.0.5**（镜像内 site-packages；`describe` 输出 `sdk_version:"1.0.5"`） |
 | 协议 | `contest.harness.workspace.v2`；prompt_version `industrial-workspace-flexible-v3` |
 | 入口 | `/app/harness.py describe\|train\|predict`；选手模块 `/app/contest_submission.py` |
-| 上传协议 | 1.0.2 内联（`candidate_request`/`state_request` 自带 `files`）；**未注入 1.0.4**，避免宿主未宣告 `chunked-v1` 时抛 `CHUNKED_UPLOAD_UNSUPPORTED` |
-| 平台校验 | 正式评测 30 轮全通（宿主接受 1.0.2 内联），本地仿真 30/30 复现 |
+| 上传协议 | 1.0.5 分块上传（`upload_begin/chunk/finish`，`artifact_upload_protocol=chunked-v1`），按官方说明升级以启用分块上传 |
+| 平台校验 | 本地协议仿真 30/30 通过（分块上传路径），父检查点指标复现偏差 0.00% |
 
 ---
 
@@ -781,7 +863,7 @@ python3 /app/harness.py predict     # stdin 逐行 {"task","inputs"} → stdout 
 
 ```json
 {"protocol":"contest.harness.workspace.v2","model_access":"host_gateway_rpc",
- "sdk":"contest_harness","sdk_version":"1.0.2",
+ "sdk":"contest_harness","sdk_version":"1.0.5",
  "tasks":["classification","regression"]}
 ```
 
@@ -882,7 +964,7 @@ exec sleep infinity
 | `history` 条数与非 empty_layer 层数一致（6 条 / 1 非空） | ✅ |
 | `/app` 12 文件与源目录逐条一致；`run.sh` 层内模式 0o755；无 `__pycache__`/`.pyc`/`contest_harness` 副本 | ✅ |
 | 成员路径无盘符、无绝对路径、无 `..`；未替换载荷逐条（大小+sha256）一致 | ✅ |
-| 解包后用本机 python 在 rootfs 上跑 `describe` | ✅ 返回合法 JSON（`sdk_version:"1.0.2"`） |
+| 解包后用本机 python 在 rootfs 上跑 `describe` | ✅ 返回合法 JSON（`sdk_version:"1.0.5"`） |
 | Windows 解包无法创建 822 个符号链接 | ⚠️ 本机限制，不影响 tar 本体 |
 
 ---
@@ -935,9 +1017,9 @@ cd work\c
 
 ```powershell
 cd work\harness
-$sdk102 = "<SDK 1.0.2 目录>"
+$sdk102 = "<SDK 1.0.5 目录>"
 
-# 主证据：真实 /app × SDK 1.0.2 × 10 轮 × 3 数据集（约 4–5 min）
+# 主证据：真实 /app × SDK 1.0.5 × 10 轮 × 3 数据集（约 4–5 min）
 & $py -X utf8 platform_sim.py --app app-202 --sdk $sdk102 --datasets A B C --rounds 10 --runs-root runs-app202 --no-sdk-selftest
 
 # 空壳提交 + SDK 1.0.4（验证分块上传路径）
@@ -983,7 +1065,7 @@ python3 /app/harness.py predict < samples.jsonl
 | `PARENT_DIGEST_MISMATCH` | `/previous` 字节被改，或绕开 `rnd.parent.path()` 直接读文件 | 只用 SDK 接口读父产物；不改 `/previous` |
 | `ROUND_ACK_MISSING` | `finish` 后在 `round_ack accepted=true` 之前继续发帧或提前退出 | `finish` 后等待 ack，然后立即退出进程 |
 | `MODEL_CALL_REQUIRED` | `model_call_ids` 为空或引用了非本轮调用 | 每轮先 `rnd.model()`，`finish` 用 `list(rnd.call_ids)` |
-| `CHUNKED_UPLOAD_UNSUPPORTED` | 给镜像注入了 SDK 1.0.4，而宿主未宣告 `chunked-v1` | 保持镜像内 1.0.2；不要升级 SDK |
+| `CHUNKED_UPLOAD_UNSUPPORTED` | 宿主未宣告 `chunked-v1`（旧宿主） | 企业赛宿主已支持分块上传；若遇旧宿主，改用 1.0.2 内联镜像 |
 | `Model.save` 报目标已存在 | `/workspace` 未清空或复用路径 | 每轮用新的 `tempfile.mkdtemp()` 子目录 |
 | predict 整次测量失败 | 少写一行、未 flush、等 EOF、分数越界或最高分不唯一 | 逐行输出并 flush；分类分数∈[0,1]、最高分唯一；回归非负有限 |
 | `RPC_OUTCOME_UNKNOWN` | RPC 被信号/超时中断，宿主是否处理未知 | 不要捕获后继续调用；本轮会话不可复用，直接失败退出 |
@@ -1025,7 +1107,7 @@ cd work\harness; & $py -X utf8 platform_sim.py --app app-202 --sdk $sdk102 --dat
 | `baselines/data.py` | 3994 | `6099e312829ac3aaf48209ec1f618532c4a8552fedf73f09cf31c8876261db65` |
 | `baselines/model.py` | 11988 | `325026d80747eb36f39c8df1be02b640ae21b3cd082827c66aacbdf273dd61c5` |
 | `baselines/predict.py` | 1536 | `80e6787cd862dfefd85cd6bfcd73b5577dd90e202dd3d5bb9f18a52761807452` |
-| `contest_submission.py` | 27113 | `6b00a34db8b84ed49f0ddc3eb7535eb0149b7928b52b51939398cabdbf2316fb` |
+| `contest_submission.py` | 32761 | `f14c146af98f762abf56e1ecbb343a420d5c434efb9d1bace6bd8233010fb203` |
 | `harness.py` | 204 | `6ef17e7dfd73558daf8464f7be8b1e963ccf103c76638c623911ec5c334c93f5` |
 | `run.sh` | 393 | `f4c1a12b5724c6b46e28c3b90500ddecd7524f8098e52a2b8660898e959c79d8` |
 | `stage_policy.py` | 10255 | `7631824ae58d8710b802bb644c6756a903909325fec9fb48214000469ba07081` |
