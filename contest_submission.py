@@ -275,10 +275,17 @@ def train(rnd):
     digest = _projection_digest_files(dataset, rnd)
     previous = _previous_state(rnd)
     force_retrain = os.environ.get("CONTEST_FORCE_RETRAIN", "0") == "1"
+    # A 题训练极便宜（单轮 2~3 秒），且整体墙钟由 C 题独占（并行 Pod），因此 A 不做快进：
+    # 多一轮重训就多一次"超过父模型"的机会。实测 v12（每轮重训）A 隐藏 0.9021，
+    # v14（快进）降到 0.8828。B/C 保持快进（它们才是时长大头）。
+    fastpath_datasets = [item.strip() for item in
+                         os.environ.get("CONTEST_FASTPATH", "B,C").split(",") if item.strip()]
+    fastpath_ok = dataset in fastpath_datasets
 
     # 同一份公开投影只搜索一次：上一轮在同一投影上真正跑过候选（或已判保留父模型），
     # 本轮直接保留父模型 —— 不读数据、不建矩阵、不训练，只做一次真实模型调用。
-    if (not force_retrain and digest is not None and previous.get("digest") == digest
+    if (not force_retrain and fastpath_ok and digest is not None
+            and previous.get("digest") == digest
             and (previous.get("selected") == "parent" or previous.get("searched"))):
         _log("数据集=%s stage=%s 轮次=%d 投影字节指纹=%s 与上一轮一致，跳过读取与训练"
              % (dataset, stage_id, round_index, digest[:12]))
