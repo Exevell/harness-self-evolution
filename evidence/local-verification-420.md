@@ -107,11 +107,13 @@ cd ..
 |---|---|---|
 | `contest_submission.py` | `f14c146a…`（4.1.0，A 仍在快进） | **`9710a252…`（4.2.0）** |
 | `模型配置-HAR03.txt` | 5,540 B（4.1.0 版） | 5,569 B（4.2.0 版，sha `903629dd…`） |
-| 成员数 / 大小 | 54 / 218,364 B | 55 / 221,461 B（+`evidence/resource-2c4g-selfeval.md`） |
-| 新 zip sha256 | — | `d5f3f28873e106cd1d5b14de3d1c5de8b6cfe7c17e47d44f9cd5475ebd8b18f5` |
+| 成员数 / 大小 | 54 / 218,364 B | 58 / 231,534 B → 最终 226 KB（+`evidence/resource-2c4g-selfeval.md` 更新、`tools/` 两个可复现脚本） |
+| 新 zip sha256 | — | 见 `submission/交付校验值.md`（本文件也在 zip 内，自哈希会随重建变化） |
 | 同源校验 | ❌ 与镜像不一致 | ✅ 13/13 逐字节相同 |
+| 密钥扫描 | — | ✅ 无 `sk-*` / `api_key` / `Bearer` 命中 |
 
-新增 `work/build_source_zip.py` 把"打包 + 同源校验"固化成一条命令，以后每次改代码重跑即可。
+新增 `work/build_source_zip.py`（仓库内同步为 `tools/build_source_zip.py`）把"打包 + 同源校验"固化成一条命令，
+以后每次改代码重跑即可。
 
 ## 四、必须诚实说明的一点：A 题改动的本地证据强度
 
