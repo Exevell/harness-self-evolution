@@ -253,7 +253,8 @@ def train(rnd):
     # 已经采纳或已经否决的父模型 —— 再训练只是重复花费预算。因此只要上一轮在同一 digest
     # 上真正跑过候选（searched=True），本轮直接保留父模型，节省运行时长（资源效率）。
     # 判据只看"投影是否完全相同"：投影相同意味着没有新信息，重复训练不可能带来新的适配。
-    if (previous.get("digest") == digest
+    force_retrain = os.environ.get("CONTEST_FORCE_RETRAIN", "0") == "1"
+    if (not force_retrain and previous.get("digest") == digest
             and (previous.get("selected") == "parent" or previous.get("searched"))):
         _log("投影与上一轮完全一致且上一轮已判定保留父模型，本轮直接保留父模型")
         receipt = rnd.model(
@@ -365,6 +366,9 @@ def train(rnd):
         "epochs": int((best or {}).get("epochs", 0)),
         "train_rows": train_info["rows"], "validation_rows": val_info["rows"],
         "experiments": len(experiments),
+        # 审计：即使候选被拒，也留下它的实测分，便于事后判断"门槛是否过严"
+        "candidate_scores": [record.get("score") for record in experiments
+                             if isinstance(record.get("score"), (int, float))],
         "elapsed_s": round(time.time() - started, 2),
         "policy_margin": policy_margin,
         "stage_changed": stage_changed,
