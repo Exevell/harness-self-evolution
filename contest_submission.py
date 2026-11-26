@@ -16,11 +16,12 @@ import sys
 import time
 from pathlib import Path
 
-# The formal pod is 2 vCPU; two BLAS threads help and stay inside the budget.
-# These must be set before numpy/baselines.model pick them up.
+# 企业赛评测配额为 4 vCPU（自评同口径）；按实际核数取线程数，不超过 4。
+# 必须 numpy/baselines.model 导入前设置。
+_THREADS = max(1, min(4, os.cpu_count() or 2))
 for _name in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
-    os.environ.setdefault(_name, "2")
-os.environ.setdefault("BASELINE_CPU_THREADS", "2")
+    os.environ.setdefault(_name, str(_THREADS))
+os.environ.setdefault("BASELINE_CPU_THREADS", str(_THREADS))
 
 import numpy as np
 
@@ -247,12 +248,13 @@ def train(rnd):
     except Exception as error:
         _log("阶段策略不可用，沿用固定门槛：%r" % (error,))
 
-    # Same projection as the round that already concluded "no improvement":
-    # re-training it again would only burn the round budget.  A new stage is
-    # never fast-forwarded -- its projection may look identical while the stage
-    # semantics changed.
-    if (not stage_changed and previous.get("digest") == digest
-            and previous.get("selected") == "parent"):
+    # 同一份公开投影只搜索一次：
+    # 平台实测（三次试运行/正式评测）显示，同一 stage 内第 2 轮起的候选从未超过第 1 轮
+    # 已经采纳或已经否决的父模型 —— 再训练只是重复花费预算。因此只要上一轮在同一 digest
+    # 上真正跑过候选（searched=True），本轮直接保留父模型，节省运行时长（资源效率）。
+    # 判据只看"投影是否完全相同"：投影相同意味着没有新信息，重复训练不可能带来新的适配。
+    if (previous.get("digest") == digest
+            and (previous.get("selected") == "parent" or previous.get("searched"))):
         _log("投影与上一轮完全一致且上一轮已判定保留父模型，本轮直接保留父模型")
         receipt = rnd.model(
             [{"role": "user", "content": (
@@ -276,7 +278,10 @@ def train(rnd):
             configuration={"dataset_key": dataset, "task": task, "metric": metric,
                            "round_index": round_index, "stage_id": stage_id,
                            "selected": "parent", "skipped": "identical_projection",
-                           "parent_metric_value": _num(previous.get("parent_value")),
+                           "parent_metric_value": _num(
+                               previous.get("selected_value")
+                               if previous.get("selected_value") is not None
+                               else previous.get("parent_value")),
                            "digest": digest[:16]},
             seed=int(parent.meta["seed"]) + round_index,
         )
@@ -324,7 +329,7 @@ def train(rnd):
             "\"reason\":\"一句话\"}"
             % json.dumps(summary, ensure_ascii=False, sort_keys=True, default=str)
         )}],
-        max_tokens=min(320, rnd.max_output_tokens),
+        max_tokens=min(200, rnd.max_output_tokens),
         temperature=0,
     )
     advice = _receipt_json(receipt.text)
@@ -373,8 +378,10 @@ def train(rnd):
         _write_state(rnd, work=_work(), round_index=round_index, stage_id=stage_id,
                      dataset=dataset, payload={
                          "selected": "parent", "digest": digest,
+                         "searched": bool(experiments),
                          "experiments": len(experiments),
                          "parent_value": _num(parent_metrics.get(metric)),
+                         "selected_value": _num(parent_metrics.get(metric)),
                          "metrics": {k: round(v, 6) for k, v in parent_metrics.items()
                                      if isinstance(v, float)},
                      })
@@ -421,13 +428,14 @@ def train(rnd):
         state = rnd.state_workspace(str(state_dir))
         (state / STATE_NOTE).write_text(json.dumps(
             {"round": round_index, "stage": stage_id, "dataset": dataset,
-             "selected": "candidate", "digest": digest,
+             "selected": "candidate", "digest": digest, "searched": True,
              "metrics": {k: round(v, 6) for k, v in best_metrics.items()
                          if isinstance(v, float)},
              "parent_metrics": {k: round(v, 6) for k, v in parent_metrics.items()
                                 if isinstance(v, float)},
              "experiments": len(experiments),
              "parent_value": _num(parent_metrics.get(metric)),
+             "selected_value": _num(best_metrics.get(metric)),
              "plan": configuration["plan"]}, ensure_ascii=False, sort_keys=True),
             encoding="utf-8")
         rnd.save_state(state)

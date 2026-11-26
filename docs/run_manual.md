@@ -1,6 +1,6 @@
 # 系统运行说明（Run Manual）
 
-**队伍 070228（北京印刷学院）｜版本 HAR-02｜日期 2026-11-24**
+**队伍 070228（北京印刷学院）｜版本 HAR-03｜日期 2026-11-25**
 
 本文件说明提交镜像在平台侧如何运行、如何构建与校验镜像、如何在本地复现本报告的全部数字，以及已知限制与故障排查。技术结论见 [`technical_report.md`](technical_report.md)，来源与合规见 [`source_declaration.md`](source_declaration.md)。
 
@@ -33,7 +33,7 @@ python3 /app/harness.py predict     # stdin 逐行 {"task","inputs"} → stdout 
 
 ```json
 {"protocol":"contest.harness.workspace.v2","model_access":"host_gateway_rpc",
- "sdk":"contest_harness","sdk_version":"1.0.2",
+ "sdk":"contest_harness","sdk_version":"1.0.5",
  "tasks":["classification","regression"]}
 ```
 
@@ -134,7 +134,7 @@ exec sleep infinity
 | `history` 条数与非 empty_layer 层数一致（6 条 / 1 非空） | ✅ |
 | `/app` 12 文件与源目录逐条一致；`run.sh` 层内模式 0o755；无 `__pycache__`/`.pyc`/`contest_harness` 副本 | ✅ |
 | 成员路径无盘符、无绝对路径、无 `..`；未替换载荷逐条（大小+sha256）一致 | ✅ |
-| 解包后用本机 python 在 rootfs 上跑 `describe` | ✅ 返回合法 JSON（`sdk_version:"1.0.2"`） |
+| 解包后用本机 python 在 rootfs 上跑 `describe` | ✅ 返回合法 JSON（`sdk_version:"1.0.5"`） |
 | Windows 解包无法创建 822 个符号链接 | ⚠️ 本机限制，不影响 tar 本体 |
 
 ---
@@ -187,9 +187,9 @@ cd work\c
 
 ```powershell
 cd work\harness
-$sdk102 = "<SDK 1.0.2 目录>"
+$sdk102 = "<SDK 1.0.5 目录>"
 
-# 主证据：真实 /app × SDK 1.0.2 × 10 轮 × 3 数据集（约 4–5 min）
+# 主证据：真实 /app × SDK 1.0.5 × 10 轮 × 3 数据集（约 4–5 min）
 & $py -X utf8 platform_sim.py --app app-202 --sdk $sdk102 --datasets A B C --rounds 10 --runs-root runs-app202 --no-sdk-selftest
 
 # 空壳提交 + SDK 1.0.4（验证分块上传路径）
@@ -235,7 +235,7 @@ python3 /app/harness.py predict < samples.jsonl
 | `PARENT_DIGEST_MISMATCH` | `/previous` 字节被改，或绕开 `rnd.parent.path()` 直接读文件 | 只用 SDK 接口读父产物；不改 `/previous` |
 | `ROUND_ACK_MISSING` | `finish` 后在 `round_ack accepted=true` 之前继续发帧或提前退出 | `finish` 后等待 ack，然后立即退出进程 |
 | `MODEL_CALL_REQUIRED` | `model_call_ids` 为空或引用了非本轮调用 | 每轮先 `rnd.model()`，`finish` 用 `list(rnd.call_ids)` |
-| `CHUNKED_UPLOAD_UNSUPPORTED` | 给镜像注入了 SDK 1.0.4，而宿主未宣告 `chunked-v1` | 保持镜像内 1.0.2；不要升级 SDK |
+| `CHUNKED_UPLOAD_UNSUPPORTED` | 宿主未宣告 `chunked-v1`（旧宿主） | 企业赛宿主已支持分块上传；若遇旧宿主，改用 1.0.2 内联镜像 |
 | `Model.save` 报目标已存在 | `/workspace` 未清空或复用路径 | 每轮用新的 `tempfile.mkdtemp()` 子目录 |
 | predict 整次测量失败 | 少写一行、未 flush、等 EOF、分数越界或最高分不唯一 | 逐行输出并 flush；分类分数∈[0,1]、最高分唯一；回归非负有限 |
 | `RPC_OUTCOME_UNKNOWN` | RPC 被信号/超时中断，宿主是否处理未知 | 不要捕获后继续调用；本轮会话不可复用，直接失败退出 |

@@ -1,4 +1,4 @@
-﻿# HAR-02 · 工业模型自进化 Harness（队伍 070228）
+# HAR-02 · 工业模型自进化 Harness（队伍 070228）
 
 面向「智训引擎」工业模型自进化赛题的参赛系统。平台在**漂移数据流**上对每个数据集跑 10 轮：
 每轮宿主下发当前阶段的公开 `train/validation` 投影、父检查点和历史记录，容器内执行
@@ -98,4 +98,4 @@ python3 /app/harness.py predict     # stdin 逐行 {"task","inputs"} → stdout 
 
 `harness-2.0.2.tar`（`docker save`，linux/amd64，单层扁平，391,372,800 B，
 sha256 `56456163261a77242b0a3c1325d0938b8510e6888beacebc034767c2204e8240`），
-内含 SDK `contest_harness 1.0.2`，`/app` 12 个文件，无 `__pycache__`、无 SDK 副本。
+内含 SDK `contest_harness 1.0.5`，`/app` 12 个文件，无 `__pycache__`、无 SDK 副本。

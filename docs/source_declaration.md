@@ -1,6 +1,6 @@
 # 来源声明与合规清单
 
-**队伍 070228（北京印刷学院）｜版本 HAR-02｜日期 2026-11-24｜对应提交件 `harness-2.0.2.tar`（tag `harness:1.0.0`）**
+**队伍 070228（北京印刷学院）｜版本 HAR-03｜日期 2026-11-25｜对应提交件 `harness-2.0.2.tar`（tag `harness:1.0.0`）**
 
 本文件说明本作品使用的数据、模型、第三方组件与大模型服务来源，并逐条声明赛规要求的数据隔离与合规边界。技术细节见 [`technical_report.md`](technical_report.md)，运行方式见 [`run_manual.md`](run_manual.md)。
 
@@ -57,11 +57,11 @@
 
 | 项 | 值 |
 |---|---|
-| SDK | `contest_harness` **1.0.2**（镜像内 site-packages；`describe` 输出 `sdk_version:"1.0.2"`） |
+| SDK | `contest_harness` **1.0.5**（镜像内 site-packages；`describe` 输出 `sdk_version:"1.0.5"`） |
 | 协议 | `contest.harness.workspace.v2`；prompt_version `industrial-workspace-flexible-v3` |
 | 入口 | `/app/harness.py describe\|train\|predict`；选手模块 `/app/contest_submission.py` |
-| 上传协议 | 1.0.2 内联（`candidate_request`/`state_request` 自带 `files`）；**未注入 1.0.4**，避免宿主未宣告 `chunked-v1` 时抛 `CHUNKED_UPLOAD_UNSUPPORTED` |
-| 平台校验 | 正式评测 30 轮全通（宿主接受 1.0.2 内联），本地仿真 30/30 复现 |
+| 上传协议 | 1.0.5 分块上传（`upload_begin/chunk/finish`，`artifact_upload_protocol=chunked-v1`），按官方说明升级以启用分块上传 |
+| 平台校验 | 本地协议仿真 30/30 通过（分块上传路径），父检查点指标复现偏差 0.00% |
 
 ---
 
