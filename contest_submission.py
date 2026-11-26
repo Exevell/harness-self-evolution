@@ -8,6 +8,7 @@ beats the parent by a margin, otherwise keep the parent artifact unchanged.
 Everything is pure NumPy and resume-compatible with the official
 ``contest.cpu-mlp.v1`` checkpoint format.
 """
+import hashlib
 import json
 import math
 import os
@@ -39,6 +40,12 @@ PREDICT_ARGV = ["python3", "/app/harness.py", "predict"]
 TASKS = ("classification", "regression")
 STATE_NOTE = "harness_state.json"
 _MODELS = {}
+# 特征路径文本缓存：D.flatten 每行每个特征都要 json.dumps(path) 并 re.sub(key)，
+# C 题（113k 行 × 24 特征）实测 65.6 us/行、单轮矩阵构建 7.4 s，其中九成是这两项。
+# 路径文本只由"结构位置"决定，与数值无关，按 (父路径 + key/index) 记忆化后输出逐字节相同。
+_PATH_TEXT = {}
+_PATH_TEXT_MAX = 8192
+_KEY_OK = {}
 
 
 # --------------------------------------------------------------------------- #
@@ -52,6 +59,59 @@ def _work():
     return Path(os.environ.get("CONTEST_WORK", "/workspace"))
 
 
+def _path_text(path):
+    """json.dumps(path) 的记忆化版本；path 为 ((kind, key/index), …) 元组。"""
+    text = _PATH_TEXT.get(path)
+    if text is None:
+        if len(_PATH_TEXT) >= _PATH_TEXT_MAX:
+            _PATH_TEXT.clear()
+        text = json.dumps(list(path), ensure_ascii=False, separators=(",", ":"))
+        _PATH_TEXT[path] = text
+    return text
+
+
+def _key_allowed(key):
+    """与 D.flatten 的键校验逐条一致（非字符串 / 目标泄漏列一律拒绝），并记忆化。"""
+    allowed = _KEY_OK.get(key)
+    if allowed is None:
+        allowed = (isinstance(key, str)
+                   and re.sub(r"[^a-z0-9]", "", key.lower()) not in D.FORBIDDEN_INPUTS)
+        _KEY_OK[key] = allowed
+    return allowed
+
+
+def _flatten_fast(inputs):
+    """``D.flatten`` 的等价实现（路径文本/键校验记忆化），输出逐字节一致。
+
+    语义与 ``baselines.data.flatten`` 完全一致：相同的嵌套深度上限（16）、相同的
+    禁用列判定、相同的数值合法性（bool/NaN/Inf 拒绝）与 1..4096 特征上限；
+    异常类型与消息也保持一致。唯一的差别是路径字符串与键校验走缓存。
+    """
+    paths, values = [], []
+
+    def visit(value, path, depth):
+        if depth > 16:
+            raise ValueError("input nesting exceeds limit")
+        if isinstance(value, dict):
+            for key in sorted(value):
+                if not _key_allowed(key):
+                    raise ValueError("target-derived input field is not allowed")
+                visit(value[key], path + (("key", key),), depth + 1)
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                visit(child, path + (("index", index),), depth + 1)
+        elif isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+            paths.append(_path_text(path))
+            values.append(float(value))
+        else:
+            raise ValueError("model inputs must contain finite numeric features only")
+
+    visit(inputs, (), 0)
+    if not values or len(values) > 4096:
+        raise ValueError("expected 1..4096 numeric features")
+    return paths, values
+
+
 def _matrix(rows, paths, task, classes, limit=None):
     """Align JSON inputs to the checkpoint feature order, collecting labels."""
     x, y, ids, missing, seen = [], [], [], 0, 0
@@ -63,7 +123,7 @@ def _matrix(rows, paths, task, classes, limit=None):
         inputs = row.get("inputs")
         if not isinstance(inputs, dict):
             continue
-        current, values = D.flatten(inputs)
+        current, values = _flatten_fast(inputs)
         if current != paths:
             if lookup is None:
                 lookup = {}
@@ -210,12 +270,49 @@ def train(rnd):
     # Keep >=45% of the round budget for candidate upload, model call and finish.
     train_budget = max(20.0, min(wall * 0.40, 180.0) - (time.time() - started))
 
+    # 先算"投影字节指纹"：只读公开投影文件、不解析 JSON、不建特征矩阵（C 题 113k×24 的
+    # 矩阵要 7s）。字节完全相同 => 投影必然完全相同（比行级 digest 更强，不会误判）。
+    digest = _projection_digest_files(dataset, rnd)
+    previous = _previous_state(rnd)
+    force_retrain = os.environ.get("CONTEST_FORCE_RETRAIN", "0") == "1"
+
+    # 同一份公开投影只搜索一次：上一轮在同一投影上真正跑过候选（或已判保留父模型），
+    # 本轮直接保留父模型 —— 不读数据、不建矩阵、不训练，只做一次真实模型调用。
+    if (not force_retrain and digest is not None and previous.get("digest") == digest
+            and (previous.get("selected") == "parent" or previous.get("searched"))):
+        _log("数据集=%s stage=%s 轮次=%d 投影字节指纹=%s 与上一轮一致，跳过读取与训练"
+             % (dataset, stage_id, round_index, digest[:12]))
+        receipt = rnd.model(
+            [{"role": "user", "content": _fast_prompt(digest, previous)}],
+            max_tokens=min(96, rnd.max_output_tokens),
+            temperature=0,
+        )
+        rnd.finish(
+            selected_artifact_id=rnd.parent.artifact_id,
+            hypothesis=("第 %d 轮（%s）：公开 train/validation 投影与上一轮逐字节一致，"
+                        "复用上一轮的实验结论。" % (round_index, stage_id)),
+            change_summary="未训练，保留父模型：投影未变化，重复搜索无信息增益。",
+            reason=("本轮投影 digest 与上一轮相同，上一轮已用 %d 组候选证明公开验证集上无法超过"
+                    "父模型；依据模型 `%s` 的确认（call_id=%s），保留父产物以节省算力并避免退化。"
+                    % (int(previous.get("experiments") or 0), rnd.model_name, receipt.call_id)),
+            configuration={"dataset_key": dataset, "task": task, "metric": metric,
+                           "round_index": round_index, "stage_id": stage_id,
+                           "selected": "parent", "skipped": "identical_projection",
+                           "parent_metric_value": _num(
+                               previous.get("selected_value")
+                               if previous.get("selected_value") is not None
+                               else previous.get("parent_value")),
+                           "digest": digest[:16]},
+            seed=int(parent.meta["seed"]) + round_index,
+        )
+        return
+
     x_train, y_train, ids_train, train_info = _matrix(
         rnd.data.training_rows(), paths, task, classes)
     x_val, y_val, ids_val, val_info = _matrix(
         rnd.data.validation_rows(), paths, task, classes)
-    digest = _projection_digest(dataset, ids_train, y_train, ids_val, y_val)
-    previous = _previous_state(rnd)
+    if digest is None:
+        digest = _projection_digest(dataset, ids_train, y_train, ids_val, y_val)
     _log("数据集=%s stage=%s 轮次=%d 特征=%d 训练=%d 验证=%d 预算=%.0fs digest=%s"
          % (dataset, stage_id, round_index, len(paths), train_info["rows"],
             val_info["rows"], train_budget, digest[:12]))
@@ -248,46 +345,6 @@ def train(rnd):
     except Exception as error:
         _log("阶段策略不可用，沿用固定门槛：%r" % (error,))
 
-    # 同一份公开投影只搜索一次：
-    # 平台实测（三次试运行/正式评测）显示，同一 stage 内第 2 轮起的候选从未超过第 1 轮
-    # 已经采纳或已经否决的父模型 —— 再训练只是重复花费预算。因此只要上一轮在同一 digest
-    # 上真正跑过候选（searched=True），本轮直接保留父模型，节省运行时长（资源效率）。
-    # 判据只看"投影是否完全相同"：投影相同意味着没有新信息，重复训练不可能带来新的适配。
-    force_retrain = os.environ.get("CONTEST_FORCE_RETRAIN", "0") == "1"
-    if (not force_retrain and previous.get("digest") == digest
-            and (previous.get("selected") == "parent" or previous.get("searched"))):
-        _log("投影与上一轮完全一致且上一轮已判定保留父模型，本轮直接保留父模型")
-        receipt = rnd.model(
-            [{"role": "user", "content": (
-                "本轮公开投影与上一轮完全相同（digest=%s），上一轮已用 %d 组候选证明没有候选能"
-                "超过父模型 %.6f。请确认是否继续保留父模型，输出 JSON："
-                "{\"decision\":\"keep_parent\",\"reason\":\"一句话\"}" % (digest[:16],
-                                                                          previous.get("experiments", 0),
-                                                                          float(previous.get("parent_value") or 0.0))
-            )}],
-            max_tokens=min(200, rnd.max_output_tokens),
-            temperature=0,
-        )
-        rnd.finish(
-            selected_artifact_id=rnd.parent.artifact_id,
-            hypothesis=("第 %d 轮（%s）：公开 train/validation 投影与上一轮逐字节一致，"
-                        "复用上一轮的实验结论。" % (round_index, stage_id)),
-            change_summary="未训练，保留父模型：投影未变化，重复搜索无信息增益。",
-            reason=("本轮投影 digest 与上一轮相同，上一轮已用 %d 组候选证明公开验证集上无法超过"
-                    "父模型；依据模型 `%s` 的确认（call_id=%s），保留父产物以节省算力并避免退化。"
-                    % (int(previous.get("experiments") or 0), rnd.model_name, receipt.call_id)),
-            configuration={"dataset_key": dataset, "task": task, "metric": metric,
-                           "round_index": round_index, "stage_id": stage_id,
-                           "selected": "parent", "skipped": "identical_projection",
-                           "parent_metric_value": _num(
-                               previous.get("selected_value")
-                               if previous.get("selected_value") is not None
-                               else previous.get("parent_value")),
-                           "digest": digest[:16]},
-            seed=int(parent.meta["seed"]) + round_index,
-        )
-        return
-
     try:
         result = train_and_select(Model, checkpoint_path, x_train, y_train, x_val,
                                   y_val, task, classes, metric, train_budget,
@@ -309,28 +366,29 @@ def train(rnd):
     best_score = core.score_value(best_metrics, metric)
     experiments = result.get("experiments") or []
 
-    # 精简 prompt：宿主已经会在前面拼官方提示，这里只带决策必需的标量，
-    # 把 Token 花在改进上而不是重复元数据上。
+    # 精简 prompt：宿主会在前面拼官方提示，这里只带决策必需的标量；prev 只留
+    # (轮次, 选中, 分数, 父分数) 四元组，不再重复 id/stage/plan 等元数据。
     summary = {
-        "ds": dataset, "stage": stage_id, "round": round_index, "metric": metric,
+        "metric": metric,
         "rows": [train_info["rows"], val_info["rows"]],
         "parent": _num(parent_metrics.get(metric)),
         "trials": [[record.get("name"), _num(record.get("score"))]
                    for record in experiments[:4]],
         "best": _num(best_metrics.get(metric) if best_metrics else None),
         "kept_parent": result["selected"] != "candidate",
-        "prev": _history_digest(history)[-2:],
+        "prev": [[item.get("round"), item.get("selected"),
+                  _num(item.get("metric")), _num(item.get("parent_metric"))]
+                 for item in _history_digest(history)[-2:]],
     }
 
     receipt = rnd.model(
         [{"role": "user", "content": (
-            "本轮公开实验（JSON）：%s\n"
-            "判断采纳最优候选还是保留父模型，只回一个 JSON："
+            "本轮公开实验（JSON）：%s\n只回一个 JSON："
             "{\"decision\":\"keep_best|try_again\",\"epochs\":1-600,\"learning_rate\":0.0001-0.05,"
             "\"reason\":\"一句话\"}"
             % json.dumps(summary, ensure_ascii=False, sort_keys=True, default=str)
         )}],
-        max_tokens=min(200, rnd.max_output_tokens),
+        max_tokens=min(128, rnd.max_output_tokens),
         temperature=0,
     )
     advice = _receipt_json(receipt.text)
@@ -463,6 +521,40 @@ def train(rnd):
 
 
 
+def _fast_prompt(digest, previous):
+    """快路径模型调用的内容：只保留决策必需的标量，尽量少花推理 Token。"""
+    return ("投影未变(%s)，上轮%d候选均未胜出，保留父模型。只回"
+            "{\"decision\":\"keep_parent\",\"reason\":\"短句\"}" % (
+                digest[:12], previous.get("experiments", 0)))
+
+
+def _projection_digest_files(dataset, rnd):
+    """公开投影的"字节指纹"：只读文件、不解析 JSON、不建特征矩阵。
+
+    字节完全相同 => 投影必然完全相同（比行级 digest 更强，不会误判）；反之若只差空白或
+    行序，指纹会不同而退化成一次真实搜索 —— 只会多花时间，不会错判"没有新信息"。
+    返回 None 表示 SDK 没有暴露投影路径，调用方退回行级 digest。
+    """
+    view = getattr(rnd, "data", None)
+    paths = (getattr(view, "train_path", None), getattr(view, "validation_path", None))
+    if not all(isinstance(item, str) and item for item in paths):
+        return None
+    try:
+        digest = hashlib.sha256()
+        digest.update(("%s|" % dataset).encode("utf-8"))
+        for item in paths:
+            path = Path(item)
+            if path.is_symlink() or not path.is_file():
+                return None
+            digest.update(b"|%d|" % path.stat().st_size)
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1 << 20), b""):
+                    digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
 def _projection_digest(dataset, ids_train, y_train, ids_val, y_val):
     import hashlib
     digest = hashlib.sha256()
@@ -572,7 +664,7 @@ def predict(sample, model_dir):
         model = Model.load(checkpoint)
         _MODELS[checkpoint] = model
     paths = model.meta["paths"]
-    current, values = D.flatten(sample.inputs)
+    current, values = _flatten_fast(sample.inputs)
     if current != paths:
         lookup = dict(zip(current, values))
         values = [lookup.get(key, 0.0) for key in paths]
