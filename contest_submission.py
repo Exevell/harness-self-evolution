@@ -357,7 +357,8 @@ def train(rnd):
                                   y_val, task, classes, metric, train_budget,
                                   round_index, dataset, log=_log,
                                   ids_train=ids_train, ids_val=ids_val,
-                                  margin=policy_margin)
+                                  margin=policy_margin,
+                                  first_round=(int(round_index) == 1))
     except Exception as error:  # never lose the round: keep the parent
         _log("训练/选择异常，保留父模型：%r" % (error,))
         result = {"selected": "parent", "metrics": {}, "parent_metrics": {},

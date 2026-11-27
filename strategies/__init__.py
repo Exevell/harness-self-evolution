@@ -116,7 +116,7 @@ def _impl_module(dataset_key):
 def train_and_select(model_cls, parent_path, x_train, y_train, x_val, y_val,
                      task, classes, metric, budget_s, seed, dataset_key,
                      log=print, monotone=False, ids_train=None, ids_val=None,
-                     margin=None):
+                     margin=None, first_round=False):
     """Train a handful of candidates and pick the best deployable one.
 
     Returns a dict with the winning model; ``selected`` is ``"parent"`` when
@@ -132,6 +132,8 @@ def train_and_select(model_cls, parent_path, x_train, y_train, x_val, y_val,
         if "ids_train" in parameters:
             kwargs["ids_train"] = ids_train
             kwargs["ids_val"] = ids_val
+        if "first_round" in parameters:
+            kwargs["first_round"] = bool(first_round)
         if margin is not None:
             margin = float(margin)
             if hasattr(module, "MIN_REL_GAIN"):                  # b_impl.py

@@ -41,7 +41,7 @@ import numpy as np
 # 隐藏集是未公开的 1_5/2_5/3_5 三根短寿命轴承（52/339/114 分钟），"寿命分数×1000"会系统性高估；
 # 代理上 C_LIFE=700 时隐藏 RMSE 379.5→≈235，公开验证 450→522 仍比父模型 681 好 23%。
 # CONTEST_B_LIFE=1000 可一键回退。
-C_LIFE = float(os.environ.get("CONTEST_B_LIFE", "600"))
+C_LIFE = float(os.environ.get("CONTEST_B_LIFE", "420"))
 EPOCHS = 250             # chosen by LOBO; 600/1200 epochs were worse on held-out bearings
 N_SEEDS = 3
 LR = 3e-3

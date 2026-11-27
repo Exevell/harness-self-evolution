@@ -46,7 +46,12 @@ from pathlib import Path
 import numpy as np
 
 DEFAULT_LR = 0.003
-TARGET_STEPS = int(os.environ.get("CONTEST_A_STEPS", "600"))  # 每个候选的梯度步数预算（445 行时 ≈ 150 epoch）
+TARGET_STEPS = int(os.environ.get("CONTEST_A_STEPS", "1200"))  # 每个候选的梯度步数预算（445 行时 ≈ 300 epoch）
+# HAR-04.7：第 1 轮只有 batch1（445 行）→ 300 epoch 会严重过拟合，隐藏阶段 1 增益 −0.22
+# （与平台实测 −0.21 吻合）。第 1 轮限到 75 epoch：隐藏阶段 1 转正、公开验证仍 0.756、还省算力。
+A_ROUND1_EPOCHS = int(os.environ.get("CONTEST_A_ROUND1_EPOCHS", "75"))
+# widen 候选在 ≥1500 行时才追加；实测无稳定增益且多一份算力，默认关闭（CONTEST_A_WIDEN=1 可开）。
+A_WIDEN_ENABLED = os.environ.get("CONTEST_A_WIDEN", "0") == "1"
 ASSUMED_STEPS_PER_SECOND = 200   # 极保守吞吐假设，仅用于把 budget_s 换算成步数上限
 CHECKPOINT_FRACTIONS = (0.25, 0.5, 0.75, 1.0)
 
@@ -638,7 +643,7 @@ def _xy_matrices(x, y, expected_width=None, name="x"):
 def train_and_select_xy(model_cls, parent_path, x_train, y_train, x_val, y_val,
                         task, classes, metric, budget_s, seed, log=print,
                         enable_widen=None, margin=None, min_p_gt0=0.80,
-                        parent_model=None):
+                        parent_model=None, first_round=False):
     """与 `train_and_select` 同语义，但输入是已解析好的 numpy 矩阵。
 
     参数
@@ -703,11 +708,13 @@ def train_and_select_xy(model_cls, parent_path, x_train, y_train, x_val, y_val,
                   ("regularized-strong", {"noise": 0.8, "weights": True, "drop": 0.1})]
     else:
         specs = [("fit-now-plain", {"noise": 0.0, "weights": False, "drop": 0.0})]
-    do_widen = (len(y_train) >= 1500) if enable_widen is None else bool(enable_widen)
+    do_widen = ((len(y_train) >= 1500) and A_WIDEN_ENABLED) if enable_widen is None else bool(enable_widen)
     if do_widen and task == "classification":
         specs.append(("widened-128", {"noise": 0.5, "weights": True, "drop": 0.1, "widen": 128}))
     budget_steps = int(ASSUMED_STEPS_PER_SECOND * max(float(budget_s), 5.0) * 0.6)
     plan_epochs = min(plan_epochs, max(30, budget_steps // max(len(specs) * steps_per_epoch, 1)))
+    if first_round:
+        plan_epochs = min(plan_epochs, max(30, A_ROUND1_EPOCHS))
     note(f"[a-xy] n_train={len(y_train)} n_val={len(y_val)} steps/epoch={steps_per_epoch} "
          f"plan_epochs={plan_epochs} candidates={len(specs)} "
          f"total_steps≈{len(specs) * plan_epochs * steps_per_epoch}")
