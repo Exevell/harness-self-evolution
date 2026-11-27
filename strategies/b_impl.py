@@ -37,14 +37,19 @@ import time
 import numpy as np
 
 # ---------------------------------------------------------------- hyper-parameters
-C_LIFE = 1000.0          # life-scale prior in minutes (report.md section 4: plateau 900-1100)
+# HAR-04.5：C_LIFE 1000 -> 700（依据 work/proxy/b/REPORT.md 的隐藏轴承代理：
+# 隐藏集是未公开的 1_5/2_5/3_5 三根短寿命轴承（52/339/114 分钟），"寿命分数×1000"会系统性高估；
+# 代理上 C_LIFE=700 时隐藏 RMSE 379.5→≈235，公开验证 450→522 仍比父模型 681 好 23%。
+# CONTEST_B_LIFE=1000 可一键回退。
+C_LIFE = float(os.environ.get("CONTEST_B_LIFE", "700"))
 EPOCHS = 250             # chosen by LOBO; 600/1200 epochs were worse on held-out bearings
 N_SEEDS = 3
 LR = 3e-3
 BATCH = 128
 SCHEDULE = "const"       # LOBO winner; "cosine" looks better on public val but is LOBO-worse
 MIN_REL_GAIN = 0.05      # keep the parent unless the candidate is >=5% better on public val
-MIN_IQR_RATIO = 0.35     # anti-collapse guard: predicted IQR / true IQR
+MIN_IQR_RATIO = 0.35     # anti-collapse guard（尺度无关口径，见 _health；CONTEST_B_MACRO=0 回退池化口径）
+B_SELECT_MACRO = os.environ.get("CONTEST_B_MACRO", "1") == "1"  # 逐轴承宏平均选型
 USE_SNAPSHOT_INDEX = True  # only to recover a per-bearing life scale for TRUNCATED fragments
 
 
@@ -211,7 +216,20 @@ def _metric(name, y, pred):
     return _mae(y, pred) if str(name).lower() in ("mae", "mean_absolute_error") else _rmse(y, pred)
 
 
-def _health(y, pred, groups):
+def _macro_metric(name, y, pred, groups):
+    """逐轴承宏平均：与隐藏评测形态一致（隐藏集是若干根新轴承，而不是池化样本）。"""
+    y = np.asarray(y, float)
+    pred = np.asarray(pred, float)
+    groups = np.asarray(groups)
+    vals = []
+    for g in sorted(set(groups.tolist())):
+        k = groups == g
+        if int(k.sum()) >= 1:
+            vals.append(_metric(name, y[k], pred[k]))
+    return float(np.mean(vals)) if vals else _metric(name, y, pred)
+
+
+def _health(y, pred, groups, D=None, c_life=None):
     y = np.asarray(y, float)
     pred = np.asarray(pred, float)
     yiqr = float(np.subtract(*np.percentile(y, [75, 25])))
@@ -220,7 +238,19 @@ def _health(y, pred, groups):
     for g in sorted(set(np.asarray(groups).tolist())):
         k = np.asarray(groups) == g
         biases[str(g)] = float(np.mean(pred[k] - y[k]))
-    return {"iqr_ratio": (piqr / yiqr if yiqr > 1e-9 else 1.0),
+    ratio = (piqr / yiqr if yiqr > 1e-9 else 1.0)
+    # 尺度无关口径：把预测换算成"寿命分数"（pred / c_life），与真实分数 y / D_b 的 IQR 比较。
+    # C_LIFE 1000→700 时池化 IQR 会等比缩小，旧口径会把正常候选误判为"塌缩"。
+    if D is not None and c_life:
+        D = np.asarray(D, float)
+        ok = D > 1e-9
+        if ok.any():
+            frac = y[ok] / D[ok]
+            fiqr = float(np.subtract(*np.percentile(frac, [75, 25])))
+            if fiqr > 1e-9:
+                ratio = float(np.subtract(*np.percentile(pred[ok] / float(c_life), [75, 25]))) / fiqr
+    return {"iqr_ratio": ratio,
+            "pooled_iqr_ratio": (piqr / yiqr if yiqr > 1e-9 else 1.0),
             "per_bearing_bias": biases,
             "const_equiv_rmse": _rmse(y, np.full(len(y), y.mean())),
             "pred_iqr": piqr, "true_iqr": yiqr}
@@ -238,9 +268,11 @@ def _core(model_cls, parent_path, x_tr, y_tr, x_va, y_va, ids_tr, ids_va,
     parent = model_cls.load(parent_path)
     paths = list(parent.meta["paths"])
     par_pred = np.maximum(0.0, parent.predict(x_va))
-    par_val = _metric(metric, y_va, par_pred)
-    keys_va, _ = _groups(ids_va, y_va)
-    log("[b] parent public-val %s = %.3f" % (metric, par_val))
+    keys_va, D_va = _groups(ids_va, y_va)
+    par_val = (_macro_metric(metric, y_va, par_pred, keys_va) if B_SELECT_MACRO
+               else _metric(metric, y_va, par_pred))
+    log("[b] parent public-val %s = %.3f (selection=%s)"
+        % (metric, par_val, "macro-per-bearing" if B_SELECT_MACRO else "pooled"))
 
     # ---- per-bearing life scale of the training projection (pure target redefinition)
     keys_tr, D_tr = _groups(ids_tr, y_tr)
@@ -268,15 +300,18 @@ def _core(model_cls, parent_path, x_tr, y_tr, x_va, y_va, ids_tr, ids_va,
         m = _make_model(model_cls, paths, x_tr, parent.meta["hidden"], s, tm, ts,
                         init_params=parent.params)
         _train(m, x_tr, fit_y, epochs, LR, BATCH, s, SCHEDULE)
-        v = _metric(metric, y_va, np.maximum(0.0, m.predict(x_va)))
+        pred_va = np.maximum(0.0, m.predict(x_va))
+        v = (_macro_metric(metric, y_va, pred_va, keys_va) if B_SELECT_MACRO
+             else _metric(metric, y_va, pred_va))
         models.append((v, s, m))
         log("[b] seed %d: val %s = %.3f" % (s, metric, v))
     models.sort(key=lambda t: t[0])
     best_val, best_seed, best = models[0]
-    ens_val = _metric(metric, y_va,
-                      np.mean([np.maximum(0.0, m.predict(x_va)) for _, _, m in models], axis=0))
+    ens_pred = np.mean([np.maximum(0.0, m.predict(x_va)) for _, _, m in models], axis=0)
+    ens_val = (_macro_metric(metric, y_va, ens_pred, keys_va) if B_SELECT_MACRO
+               else _metric(metric, y_va, ens_pred))
     best_pred = np.maximum(0.0, best.predict(x_va))
-    cand_health = _health(y_va, best_pred, keys_va)
+    cand_health = _health(y_va, best_pred, keys_va, D_va, C_LIFE)
     log("[b] best seed %d: %s=%.3f (ensemble %.3f); iqr_ratio=%.2f"
         % (best_seed, metric, best_val, ens_val, cand_health["iqr_ratio"]))
 

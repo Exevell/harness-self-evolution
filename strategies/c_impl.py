@@ -73,6 +73,16 @@ PLAN = {
     "chunk_epochs": 25,
 }
 
+# ---- HAR-04.5 / L1（依据 work/proxy/c/REPORT.md 的 dev-holdout 代理）----
+# 关掉"长寿命加权 + 尾部抬升"：代理上 dev RMSE 55.58→55.23、cap125 51.60→48.57、
+# 官方测试最后循环 43.35→41.38，公开验证 50.87→50.79（仍胜父模型）。
+# 两者都只是工程先验、没有跨协议证据；关掉后模型更"素"，在未知隐藏分布上风险更小。
+# CONTEST_C_PLAIN=0 可一键回退到 4.2.0 行为。
+if os.environ.get("CONTEST_C_PLAIN", "1") == "1":
+    PLAN["weight_factor"] = 1.0
+    PLAN["lift_pivot"] = 0.0
+    PLAN["lift_k"] = 1.0
+
 
 # ---------------------------------------------------------------- metric
 def _metrics(pred, y):

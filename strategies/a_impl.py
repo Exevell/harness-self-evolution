@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 import tempfile
 import time
 import zlib
@@ -136,6 +137,77 @@ def _macro_f1(y, labels):
         denom = np.sum(labels == label) + np.sum(y == label)
         f1.append(2.0 * tp / denom if denom else 0.0)
     return float(np.mean(f1)) if f1 else 0.0
+
+
+# ─────────────────────────────── 输出层逐类偏置校准（HAR-04.5 / S1，见 work/proxy/a/REPORT.md）
+# 机制：漂移批次里稀疏类会整类塌缩（b3 Ethanol 0.08、b6 Toluene 0.00 …），macro-F1 对单类塌缩极敏感。
+# 做法：候选定稿后，用**训练集内部留出**（每 4 行留 1 行，纯确定性）对分类头 b2 的 6 个偏置做
+#       坐标上升；只改模型内部参数，不改特征 schema、不扩维度、不改 predict 协议。
+# 守卫：留出增益 < 0.002 不启用；启用后若公开验证集比未校准更差，立即回退。
+A_CALIB_ENABLED = os.environ.get("CONTEST_A_CALIB", "1") == "1"
+A_CALIB_MAX_SHIFT = 1.2
+A_CALIB_STEP = 0.2
+A_CALIB_PASSES = 3
+A_CALIB_HOLDOUT_EVERY = 4
+A_CALIB_MIN_GAIN = 0.002
+
+
+def _logits(model, x):
+    _, z = model.forward(model.normalized(np.asarray(x, dtype=np.float64)))
+    return z
+
+
+def _calibrate_output_bias(model, x_cal, y_cal):
+    """对输出层 b2 做逐类坐标上升，最大化训练集内部留出的 macro-F1（确定性）。"""
+    z = _logits(model, x_cal)
+    before = _macro_f1(y_cal, np.argmax(z, axis=1))
+    best = before
+    deltas = np.zeros(z.shape[1], dtype=np.float64)
+    for _ in range(A_CALIB_PASSES):
+        moved = False
+        for c in range(z.shape[1]):
+            for delta in (A_CALIB_STEP, -A_CALIB_STEP):
+                trial = deltas.copy()
+                trial[c] = float(np.clip(trial[c] + delta, -A_CALIB_MAX_SHIFT, A_CALIB_MAX_SHIFT))
+                score = _macro_f1(y_cal, np.argmax(z + trial, axis=1))
+                if score > best + 1e-12:
+                    best, deltas, moved = score, trial, True
+        if not moved:
+            break
+    return {"holdout_macro_f1_before": float(before), "holdout_macro_f1_after": float(best),
+            "deltas": [round(float(v), 4) for v in deltas]}
+
+
+def _apply_calibration(model, x_train, y_train, x_val, y_val, classes, metric, final_met, best, note, tag):
+    """把留出校准应用到候选；公开验证变差则回退。返回 (final_met, calib_dict)。"""
+    calib = None
+    if not (A_CALIB_ENABLED):
+        return final_met, calib
+    holdout = np.arange(len(y_train)) % A_CALIB_HOLDOUT_EVERY == 0
+    if int(holdout.sum()) < 80 or int((~holdout).sum()) < 200:
+        return final_met, calib
+    stats = _calibrate_output_bias(model, x_train[holdout], y_train[holdout])
+    calib = stats
+    if stats["holdout_macro_f1_after"] - stats["holdout_macro_f1_before"] < A_CALIB_MIN_GAIN:
+        calib["applied"] = False
+        calib["reverted_reason"] = "holdout_gain_too_small"
+        return final_met, calib
+    shift = np.asarray(stats["deltas"], dtype=np.float64)
+    model.params["b2"] = model.params["b2"] + shift
+    model.validate()
+    cal_met, cal_labels = _metrics(model, x_val, y_val, classes, metric)
+    if cal_met["macro_f1"] >= final_met["macro_f1"] - 1e-12:
+        delta_val = cal_met["macro_f1"] - final_met["macro_f1"]
+        best["metrics"], best["labels"] = cal_met, cal_labels
+        calib["applied"] = True
+        note(f"{tag}: 输出层校准 留出 {stats['holdout_macro_f1_before']:.4f}"
+             f"→{stats['holdout_macro_f1_after']:.4f}，公开验证 {delta_val:+.4f}")
+        return cal_met, calib
+    model.params["b2"] = model.params["b2"] - shift
+    calib["applied"] = False
+    calib["reverted_reason"] = "public_validation_worse"
+    note(f"{tag}: 校准后公开验证变差，回退")
+    return final_met, calib
 
 
 def _per_class(y, labels, classes):
@@ -433,6 +505,9 @@ def train_and_select(model_cls, parent_ckpt_path, train_rows, val_rows, task, cl
         model.meta.update(best["meta"])
         model.validate()
         final_met, _ = _metrics(model, validation["x"], validation["y"], classes, metric)
+        final_met, calib = _apply_calibration(model, train["x"], train["y"], validation["x"],
+                                              validation["y"], classes, metric, final_met, best, note,
+                                              f"[a] {name}")
         ckpt = _save(model, outdir, stem=f"cand-{name}")
         seconds = time.monotonic() - t0
         experiments.append({
@@ -447,6 +522,7 @@ def train_and_select(model_cls, parent_ckpt_path, train_rows, val_rows, task, cl
             "per_class_recall": {k: round(v, 4) for k, v in best["metrics"]["per_class_recall"].items()},
             "param_relative_l2_from_parent": round(_param_move(model, parent), 4),
             "train_seconds": round(seconds, 3), "widen": widen_info,
+            "calibration": calib,
             "checkpoint": str(ckpt), "checkpoint_sha256": _digest(ckpt)})
         candidates.append({"name": name, "score": best["metrics"]["macro_f1"],
                            "labels": best["labels"], "metrics": best["metrics"],
@@ -664,6 +740,8 @@ def train_and_select_xy(model_cls, parent_path, x_train, y_train, x_val, y_val,
         model.meta.update(best["meta"])
         model.validate()
         final_met, _ = _metrics(model, x_val, y_val, classes, metric)
+        final_met, calib = _apply_calibration(model, x_train, y_train, x_val, y_val, classes, metric,
+                                              final_met, best, note, f"[a-xy] {name}")
         experiments.append({
             "name": name,
             "spec": {"noise": spec["noise"], "class_balanced_weights": spec["weights"],
@@ -676,6 +754,7 @@ def train_and_select_xy(model_cls, parent_path, x_train, y_train, x_val, y_val,
             "per_class_recall": {k: round(v, 4) for k, v in best["metrics"]["per_class_recall"].items()},
             "param_relative_l2_from_parent": round(_param_move(model, parent), 4),
             "train_seconds": round(time.monotonic() - t0, 3), "widen": widen_info,
+            "calibration": calib,
             "checkpoint": None})
         candidates.append({"name": name, "score": best["metrics"]["macro_f1"],
                            "labels": best["labels"], "metrics": best["metrics"],
