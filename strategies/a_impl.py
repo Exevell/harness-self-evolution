@@ -46,7 +46,7 @@ from pathlib import Path
 import numpy as np
 
 DEFAULT_LR = 0.003
-TARGET_STEPS = 1200          # 每个候选的梯度步数预算（445 行时 ≈ 300 epoch，实测 1-2s）
+TARGET_STEPS = int(os.environ.get("CONTEST_A_STEPS", "600"))  # 每个候选的梯度步数预算（445 行时 ≈ 150 epoch）
 ASSUMED_STEPS_PER_SECOND = 200   # 极保守吞吐假设，仅用于把 budget_s 换算成步数上限
 CHECKPOINT_FRACTIONS = (0.25, 0.5, 0.75, 1.0)
 
