@@ -83,6 +83,12 @@ if os.environ.get("CONTEST_C_PLAIN", "1") == "1":
     PLAN["lift_pivot"] = 0.0
     PLAN["lift_k"] = 1.0
 
+# HAR-04.6：C 在客观分里已被截断（增益为负 → 0 分），但 C 训练占了总训练算力的绝大部分。
+# 砍 C 的训练量只影响"资源效率"（正向）与 C 的公开指标（不影响已得分的 A/B），
+# 前提是 C 仍能在公开验证集上以 ≥1% 边际被采纳（否则 C 的 recovery 分会丢）。
+# CONTEST_C_EPOCHS=160 可回退到 4.3.0 行为。
+PLAN["epochs"] = int(os.environ.get("CONTEST_C_EPOCHS", "60"))
+
 
 # ---------------------------------------------------------------- metric
 def _metrics(pred, y):
