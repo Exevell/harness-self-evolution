@@ -49,7 +49,7 @@ DEFAULT_LR = 0.003
 TARGET_STEPS = int(os.environ.get("CONTEST_A_STEPS", "1200"))  # 每个候选的梯度步数预算（445 行时 ≈ 300 epoch）
 # HAR-04.7：第 1 轮只有 batch1（445 行）→ 300 epoch 会严重过拟合，隐藏阶段 1 增益 −0.22
 # （与平台实测 −0.21 吻合）。第 1 轮限到 75 epoch：隐藏阶段 1 转正、公开验证仍 0.756、还省算力。
-A_ROUND1_EPOCHS = int(os.environ.get("CONTEST_A_ROUND1_EPOCHS", "75"))
+A_ROUND1_EPOCHS = int(os.environ.get("CONTEST_A_ROUND1_EPOCHS", "400"))
 # widen 候选在 ≥1500 行时才追加；实测无稳定增益且多一份算力，默认关闭（CONTEST_A_WIDEN=1 可开）。
 A_WIDEN_ENABLED = os.environ.get("CONTEST_A_WIDEN", "0") == "1"
 ASSUMED_STEPS_PER_SECOND = 200   # 极保守吞吐假设，仅用于把 budget_s 换算成步数上限
