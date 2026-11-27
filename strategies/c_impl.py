@@ -87,7 +87,35 @@ if os.environ.get("CONTEST_C_PLAIN", "1") == "1":
 # 砍 C 的训练量只影响"资源效率"（正向）与 C 的公开指标（不影响已得分的 A/B），
 # 前提是 C 仍能在公开验证集上以 ≥1% 边际被采纳（否则 C 的 recovery 分会丢）。
 # CONTEST_C_EPOCHS=160 可回退到 4.3.0 行为。
-PLAN["epochs"] = int(os.environ.get("CONTEST_C_EPOCHS", "60"))
+PLAN["epochs"] = int(os.environ.get("CONTEST_C_EPOCHS", "120"))
+
+# HAR-04.9：工况簇均衡（依据 work/proxy/c_condbalance_test.py 的 dev-holdout 代理）
+# 平台 C 的塌缩集中在多工况子集（FD002/FD004）。用 3 维运行设置做 k=12 的确定性 k-means，
+# 按 1/簇频率 对训练集重采样（纯训练侧，不改输入 schema、不改 checkpoint、不改推理），
+# 代理上 FD002/FD004 从 −0.04/−0.03 抬到 +0.003/+0.013，四阶段均值 0.086→0.129。
+C_COND_BALANCE = os.environ.get("CONTEST_C_BALANCE", "1") == "1"
+C_COND_CLUSTERS = int(os.environ.get("CONTEST_C_CLUSTERS", "12"))
+
+
+def _condition_labels(settings, k=None, iters=25, seed=0):
+    """对 3 维运行设置做确定性 k-means，返回每个样本的工况簇号。"""
+    k = C_COND_CLUSTERS if k is None else int(k)
+    settings = np.asarray(settings, dtype=np.float64)
+    n = len(settings)
+    if n == 0:
+        return None
+    k = max(1, min(int(k), n))
+    rng = np.random.default_rng(seed)
+    centers = settings[rng.choice(n, k, replace=False)].copy()
+    labels = np.zeros(n, dtype=np.int64)
+    for _ in range(int(iters)):
+        dist = ((settings[:, None, :] - centers[None, :, :]) ** 2).sum(-1)
+        labels = dist.argmin(1)
+        for j in range(k):
+            sel = labels == j
+            if sel.any():
+                centers[j] = settings[sel].mean(0)
+    return labels
 
 
 # ---------------------------------------------------------------- metric
@@ -304,6 +332,21 @@ def _fit_select(model_cls, parent_path, x_tr, y_tr, x_va, y_va, budget_s, seed, 
     parent_metrics = _metrics(_predict(parent, x_va), y_va)
     log(f"[c] parent: rmse={parent_metrics['rmse']:.4f} mae={parent_metrics['mae']:.4f} "
         f"nasa_sum={parent_metrics['nasa_sum']:.3e} (n_train={len(x_tr)}, n_val={len(x_va)})")
+
+    # ---- HAR-04.9：工况簇均衡（把多工况子集 FD002/FD004 的系统性退化救回来）
+    if C_COND_BALANCE and len(y_tr) >= 1000:
+        try:
+            labels = _condition_labels(x_tr[:, :3])
+            counts = np.bincount(labels, minlength=int(labels.max()) + 1).astype(np.float64)
+            w = (1.0 / np.maximum(counts, 1.0))[labels]
+            rng = np.random.default_rng(20261127)
+            idx = rng.choice(len(y_tr), size=len(y_tr), replace=True, p=w / w.sum())
+            x_tr, y_tr = x_tr[idx], y_tr[idx]
+            share = np.bincount(labels[idx], minlength=len(counts)) / float(len(idx))
+            log("[c] 工况均衡：%d 簇，重采样 %d 行（簇占比 %s）"
+                % (len(counts), len(idx), np.round(share, 3).tolist()))
+        except Exception as error:  # 均衡失败不影响主流程
+            log("[c] 工况均衡跳过：%r" % (error,))
 
     # ---- candidate: resume the parent (never re-initialise); widen only if asked
     model = model_cls.load(str(parent_path))
