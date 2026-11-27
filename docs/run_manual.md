@@ -1,6 +1,6 @@
 # 系统运行说明（Run Manual）
 
-**队伍 070228（北京印刷学院）｜版本 HAR-03｜日期 2026-11-25**
+**队伍 070228（北京印刷学院）｜版本 HAR-04（镜像 `harness-4.2.0.tar`）｜日期 2026-11-27**
 
 本文件说明提交镜像在平台侧如何运行、如何构建与校验镜像、如何在本地复现本报告的全部数字，以及已知限制与故障排查。技术结论见 [`technical_report.md`](technical_report.md)，来源与合规见 [`source_declaration.md`](source_declaration.md)。
 
@@ -10,12 +10,12 @@
 
 | 提交件 | 位置 | 说明 |
 |---|---|---|
-| 系统镜像 | `harness-2.0.2.tar`（391,372,800 B） | `docker save` 未压缩、linux/amd64、单层扁平；tag `harness:1.0.0`；sha256 `56456163261a77242b0a3c1325d0938b8510e6888beacebc034767c2204e8240` |
-| 源码 | 镜像 `/app` + 源码仓库 | 接入层、三题策略、基线、`run.sh` |
+| 系统镜像 | **`harness-4.2.0.tar`（391,475,200 B / 373.34 MiB）** | `docker save` 未压缩、linux/amd64、单层扁平；tag `harness:1.0.0`；sha256 `e214ef6a0f282524a60cdb468e2b0ff25ed1ebe891b46978c6b1a62ea979ae75` |
+| 源码 | 镜像 `/app` + 源码仓库 | 接入层、三题策略、基线、`stage_policy.py`、`run.sh` |
 | 文档 | `docs/technical_report.md`、`docs/source_declaration.md`、`docs/run_manual.md` | 本套材料 |
 | 实验结果 | 见技术报告 §6.6 | 逐轮帧、逐 epoch 轨迹、样本外预测缓存 |
 
-镜像内 `/app` 共 12 个文件（138.3 KiB / 141,606 B）：`harness.py`(204 B)、`contest_submission.py`(24,825 B)、`run.sh`(393 B, 权限 0755)、`baselines/`（`__init__`、`data`、`model`、`predict`）、`strategies/`（`__init__`、`a_impl`、`b_impl`、`c_impl`、`core`）。
+镜像内 `/app` 共 **13 个文件（160.4 KiB）**：`harness.py`、`contest_submission.py`、`run.sh`（权限 0755）、`stage_policy.py`、`baselines/`（`__init__`、`data`、`model`、`predict`）、`strategies/`（`__init__`、`a_impl`、`b_impl`、`c_impl`、`core`）。
 
 ---
 
@@ -56,7 +56,7 @@ python3 /app/harness.py predict     # stdin 逐行 {"task","inputs"} → stdout 
 1. **收帧**：从 stdin 读 `start` 帧（dataset_key、round_index、stage_id、`task` 合同、`public_projection`、父产物与 `checkpoint_sha256`、history、`wall_seconds`、`limits`）。
 2. **读数据**：按 `rnd.task["public_projection"]` 打开 train/validation；特征展开顺序严格按父检查点 `meta.paths`。
 3. **复测父模型**：同一 validation 上先算父模型指标（macro-F1 / RMSE / MAE / NASA / IQR），作为本轮对照。
-4. **投影 digest**：`dataset|n_train|n_val|ids|Σy`；若与上一轮相同且上一轮 selected=parent → **快进**：做 1 次 `rnd.model()`，`finish(selected_artifact_id=父产物, configuration.skipped="identical_projection")`，本轮结束（不写 state，沿用上一份）。
+4. **投影 digest**：`dataset|n_train|n_val|ids|Σy`；若与上一轮相同且上一轮 selected=parent → **快进**：做 1 次 `rnd.model()`，`finish(selected_artifact_id=父产物, configuration.skipped="identical_projection")`，本轮结束（不写 state，沿用上一份）。**4.2.0 起快进只对 B/C 生效**（`CONTEST_FASTPATH` 默认 `B,C`）：A 每轮都真实重训候选、保留逐轮采纳机会，理由见技术报告 §7.7。
 5. **候选训练**：按数据集分发到 `strategies/a_impl.py|b_impl.py|c_impl.py`；每个候选 `Model.load(父)` 后继续；训练预算 `max(20, min(0.40×wall, 180) − 已用时)` 秒；C 题每 25 epoch 检查墙钟，超 `budget×0.85` 早停。
 6. **门槛判定**（同一 validation、与父模型配对比较）：
    - A：`gain ≥ 0.008`（n_val≥800，否则 0.020）且配对 bootstrap `P(diff>0) ≥ 0.80`；
@@ -103,10 +103,12 @@ rnd.finish(
 # 1) 准备打包用 /app：源码快照 + 去 __pycache__/.pyc + 最小 run.sh（LF、0755）
 #    final-app/ = app-final/ 去掉 SNAPSHOT.json、去掉 __pycache__，加 run.sh
 # 2) 以官方 1.0.0 镜像为底，只替换 /app，单层重打包并自校验
-& $py -X utf8 repack_image.py --image <原始 harness-1.0.0 镜像 tar> --app-dir final-app --tags harness:1.0.0 --output harness-2.0.2.tar
+& $py -X utf8 repack_image.py --image <原始 harness-1.0.0 镜像 tar> --app-dir final-app --tags harness:1.0.0 --output harness-4.2.0.tar
 ```
 
-> 本次实际使用的底镜像是 `harness-1.0.0-artfix.tar`（373.62 MiB，原层 `layer-759b466965a6`）；重打包后层为 `layer-84c872ea02fc`（373.23 MiB），保留原层载荷 13,259 个成员并逐条比对。
+> **历史构建记录（HAR-02 阶段，保留原数）**：底镜像 `harness-1.0.0-artfix.tar`（373.62 MiB，原层 `layer-759b466965a6`），
+> 重打包后层为 `layer-84c872ea02fc`（373.23 MiB），保留原层载荷 13,259 个成员并逐条比对。
+> 4.2.0 沿用同一 `repack_image.py` 流程（只替换 `/app`、不注入 SDK），层名与字节数以 §3.2 的 4.2.0 实测为准。
 
 `run.sh`（平台实际执行 `python3 /app/harness.py …`，该脚本只兼容原镜像 `Entrypoint`）：
 
@@ -120,19 +122,22 @@ exec sleep infinity
 
 ```powershell
 # 结构校验 + 安全解包 + 层内 /app 卫生检查 + describe 自检
-& $py -X utf8 verify_image.py --image harness-2.0.2.tar --dest image-rootfs-v202 --report runs\verify_image_v202.md
+& $py -X utf8 verify_image.py --image harness-4.2.0.tar --dest image-rootfs-v420 --report runs\verify_image_v420.md
 # 只校验结构、不解包
-& $py -X utf8 verify_image.py --image harness-2.0.2.tar --no-extract
+& $py -X utf8 verify_image.py --image harness-4.2.0.tar --no-extract
+# 三方一致（镜像 /app vs 源码仓库 vs app_manifest.md）
+& $py -X utf8 ..\ops\check_consistency.py --image harness-4.2.0.tar
 ```
 
-校验项与实测结论：
+校验项与实测结论（4.2.0）：
 
 | 检查项 | 结果 |
 |---|---|
 | manifest / repositories / config 交叉一致；单层扁平；tag `harness:1.0.0` | ✅ |
-| 层 sha256 == `config.rootfs.diff_ids[0]`（`84c872ea02fc…`） | ✅ |
+| 层 sha256 == `config.rootfs.diff_ids[0]`（`3be92899b0e2…`） | ✅ |
 | `history` 条数与非 empty_layer 层数一致（6 条 / 1 非空） | ✅ |
-| `/app` 12 文件与源目录逐条一致；`run.sh` 层内模式 0o755；无 `__pycache__`/`.pyc`/`contest_harness` 副本 | ✅ |
+| `/app` **13 文件**与源目录逐条一致；`run.sh` 层内模式 0o755；无 `__pycache__`/`.pyc`/`contest_harness` 副本 | ✅ |
+| 镜像 /app、源码仓库、`app_manifest.md` 三方一致 | ✅ **13/13，drift=0，warnings=0** |
 | 成员路径无盘符、无绝对路径、无 `..`；未替换载荷逐条（大小+sha256）一致 | ✅ |
 | 解包后用本机 python 在 rootfs 上跑 `describe` | ✅ 返回合法 JSON（`sdk_version:"1.0.5"`） |
 | Windows 解包无法创建 822 个符号链接 | ⚠️ 本机限制，不影响 tar 本体 |
@@ -187,20 +192,31 @@ cd work\c
 
 ```powershell
 cd work\harness
-$sdk102 = "<SDK 1.0.5 目录>"
+$sdk105 = "<SDK 1.0.5 目录>"
 
-# 主证据：真实 /app × SDK 1.0.5 × 10 轮 × 3 数据集（约 4–5 min）
-& $py -X utf8 platform_sim.py --app app-202 --sdk $sdk102 --datasets A B C --rounds 10 --runs-root runs-app202 --no-sdk-selftest
+# 主证据：镜像里的 /app × SDK 1.0.5 × 30 轮 × 2 线程（2c4g 口径，约 1 min）
+#   先解包镜像，再以 image-verify-420\app 为被测对象
+& $py -X utf8 verify_image.py --image harness-4.2.0.tar --dest image-verify-420
+& $py -X utf8 platform_sim.py --app image-verify-420\app --sdk $sdk105 `
+    --datasets A B C --rounds 10 --threads 2 --runs-root runs-verify-420 --no-sdk-selftest
 
-# 空壳提交 + SDK 1.0.4（验证分块上传路径）
-& $py -X utf8 platform_sim.py --datasets A B C --rounds 10
+# 对照臂：4.1.0 的"全快进"行为（A 也快进），用于验证开关与指标无损
+& $py -X utf8 platform_sim.py --app image-verify-420\app --sdk $sdk105 `
+    --datasets A B C --rounds 10 --threads 2 --env CONTEST_FASTPATH=A,B,C `
+    --runs-root runs-verify-420-allfast --no-sdk-selftest
+
+# 汇总检查（30 轮 PASS/FAIL + 跨运行确定性）
+& $py -X utf8 verify_summary.py --run runs-verify-420 --label "默认(B,C)" `
+    --run runs-verify-420-allfast --label "全快进(A,B,C)"
 
 # 只打印一帧 start / 缩短验证集调试
 & $py -X utf8 platform_sim.py --show-frame A
 & $py -X utf8 platform_sim.py --datasets C --rounds 1 --val-limit 2000
 ```
 
-期望：退出码 0；`runs-app202/summary.md` 中 A 0.755119 / B 450.316 / C 50.258 选中，第 2–10 轮 parent，30/30 无失败，父检查点复现偏差 0.00%。
+期望：退出码 0；`runs-verify-420/summary.md` 中 A 0.755119 / B 450.316 / **C 50.867** 选中，30/30 无失败，
+父检查点复现偏差 0.00%；30 轮墙钟约 52 s、峰值 RSS 229.4 MiB；两臂末轮指标与选中产物 id 逐位相同
+（详见 `work/LOCAL_VERIFICATION_420.md`）。
 
 ### 4.3 单轮手动跑（不依赖仿真器）
 
@@ -219,7 +235,7 @@ python3 /app/harness.py predict < samples.jsonl
 |---|---|---|---|
 | 1 | 仿真器只换 `stage_id`、不换公开投影 | 未在仿真里验证"换阶段一次性适配" | 用技术报告 §6.3 的三个模拟 stage 单独验证（首轮 −3.1%~−5.6%） |
 | 2 | 仿真器模型调用是离线 stub | 未验证真实网关延迟与返回质量 | 协议层（每轮≥1 次真实调用、`model_call_ids` 非空）已验证；真实质量待试运行 |
-| 3 | RSS/耗时是本机相对参考 | 不能直接当正式环境数字 | 正式 2 vCPU 预算下 C 端到端 50.3–60.6 s、峰值 229 MiB，余量充足 |
+| 3 | RSS/耗时是本机相对参考 | 不能直接当正式环境数字 | 4.2.0 在 2c4g 口径下 C 最长单轮 **20.0 s / 230 s**、峰值 **229.4 MiB / 4096 MiB**，余量充足 |
 | 4 | Windows 无 chroot，只读权限未强制 | 本地写 `/app` 会"成功"，不能验证只读边界 | 代码层不写 `/app`；正式环境由平台强制 |
 | 5 | 符号链接在 Windows 解包失败（822 个） | 仅影响本机解包，不影响 tar | 不影响提交；`/app` 与 site-packages 已解出并 `describe` 通过 |
 | 6 | `subst` 可能残留盘符 | 下次运行冲突 | `subst` 查看后 `subst X: /D`；仿真器正常结束会自行释放 |
@@ -239,7 +255,7 @@ python3 /app/harness.py predict < samples.jsonl
 | `Model.save` 报目标已存在 | `/workspace` 未清空或复用路径 | 每轮用新的 `tempfile.mkdtemp()` 子目录 |
 | predict 整次测量失败 | 少写一行、未 flush、等 EOF、分数越界或最高分不唯一 | 逐行输出并 flush；分类分数∈[0,1]、最高分唯一；回归非负有限 |
 | `RPC_OUTCOME_UNKNOWN` | RPC 被信号/超时中断，宿主是否处理未知 | 不要捕获后继续调用；本轮会话不可复用，直接失败退出 |
-| describe 未通过 | `/app/harness.py` 缺失、选手模块 import 失败、`tasks` 声明不符 | 检查 12 个文件齐全、`PYTHONPATH` 含 SDK、无语法错误 |
+| describe 未通过 | `/app/harness.py` 缺失、选手模块 import 失败、`tasks` 声明不符 | 检查 **13** 个文件齐全、`PYTHONPATH` 含 SDK、无语法错误 |
 
 ---
 
@@ -260,9 +276,10 @@ $py="…\python.exe"
 & $py work\b\step15_validate2.py
 & $py work\c\test_xy.py
 
-# 3) 平台协议 30 轮仿真（$sdk102 见 §4.2，先 cd 到 work\harness）
-cd work\harness; & $py -X utf8 platform_sim.py --app app-202 --sdk $sdk102 --datasets A B C --rounds 10 --runs-root runs-app202 --no-sdk-selftest
+# 3) 平台协议 30 轮仿真（$sdk105 见 §4.2，先 cd 到 work\harness；2 线程 = 2c4g 口径）
+cd work\harness; & $py -X utf8 platform_sim.py --app image-verify-420\app --sdk $sdk105 --datasets A B C --rounds 10 --threads 2 --runs-root runs-verify-420 --no-sdk-selftest
 
-# 4) 镜像校验
-& $py -X utf8 verify_image.py --image harness-2.0.2.tar --dest image-rootfs-v202 --report runs\verify_image_v202.md
+# 4) 镜像校验 + 三方一致
+& $py -X utf8 verify_image.py --image harness-4.2.0.tar --dest image-rootfs-v420 --report runs\verify_image_v420.md
+& $py -X utf8 ..\ops\check_consistency.py --image harness-4.2.0.tar
 ```
